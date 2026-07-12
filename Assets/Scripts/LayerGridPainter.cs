@@ -41,7 +41,7 @@ public partial class LayerGridPainter : MonoBehaviour
     [Tooltip("每次模拟更新执行多少步（值越大水流越快，但可能视觉跳跃）")]
     public int simulationStepsPerTick = 1;
 
-    [Tooltip("是否实时跟踪物体移动（运行时重新检测物体位置）")]
+    [Tooltip("是否实时跟踪物体移动")]
     public bool trackObjectMovement = true;
 
     [Tooltip("可拖拽物体的Tag名称列表")]
