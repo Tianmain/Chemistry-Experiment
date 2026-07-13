@@ -54,6 +54,9 @@ public partial class LayerGridPainter : MonoBehaviour
     [Tooltip("拖拽时物体的最大移动速度（世界单位/秒）")]
     public float dragSpeed = 10f;
 
+    [Tooltip("父子/同组可拖拽物体之间的碰撞穿透容差（世界单位），用于灯帽套合等场景")]
+    public float parentChildCollisionTolerance = 0.2f;
+
     [Header("Layer 设置")]
     [Tooltip("障碍物 Layer 名称列表")]
     public string[] obstacleLayerNames = { "Obstacle" , "Equipment" };
@@ -117,6 +120,8 @@ public partial class LayerGridPainter : MonoBehaviour
     private Bounds m_draggedObjOriginalBounds;
     private Collider2D m_draggedCollider;
     private Vector3 m_lastValidDragPos;
+    private Collider2D[] m_draggedObjColliders; // 被拖拽物体的碰撞器缓存（用于精确偏移格子）
+    private bool[] m_draggedCoverage; // 拖拽开始时缓存的格子覆盖状态（原始位置）
 
     // 液体颜色网格（与 m_grid 并行，仅对 Water 格子有效）
     private Color[,] m_liquidColorGrid;
@@ -544,6 +549,40 @@ public partial class LayerGridPainter : MonoBehaviour
         RebuildGrid();
     }
 
+    /// <summary>
+    /// 从指定碰撞体区域内移除一格水（优先移除最上方的水格）
+    /// </summary>
+    /// <returns>是否成功移除了一格水</returns>
+    public bool RemoveWaterFromRegion(Collider2D[] regionColliders)
+    {
+        if (m_grid == null || regionColliders == null || regionColliders.Length == 0) return false;
+
+        // 优先移除最上方的水格（从顶部向下搜索）
+        for (int row = m_rows - 2; row >= 1; row--)
+        {
+            for (int col = 1; col < m_columns - 1; col++)
+            {
+                if (m_grid[col, row] != CellState.Water) continue;
+
+                Vector2 worldPos = new Vector2(
+                    m_originX + (col + 0.5f) * cellSize,
+                    m_originY + (row + 0.5f) * cellSize);
+
+                foreach (var colld in regionColliders)
+                {
+                    if (colld != null && colld.OverlapPoint(worldPos))
+                    {
+                        m_grid[col, row] = CellState.Empty;
+                        m_liquidColorGrid[col, row] = Color.clear;
+                        m_isDirty = true;
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
     private void RefreshColors()
     {
         if ((gridTexture == null || pixelCache == null || fillCache == null) && !m_isRebuilding)
@@ -632,15 +671,13 @@ public partial class LayerGridPainter : MonoBehaviour
                 else
                     continue;
 
-                // 判断该网格是否在被拖拽物体的原始范围内
+                // 判断该网格是否被被拖拽物体的实际碰撞器覆盖（使用拖拽开始时缓存的原始覆盖状态）
                 bool shouldOffset = false;
-                if (hasOriginalBounds)
+                if (hasOriginalBounds && m_draggedCoverage != null)
                 {
-                    Vector2 cellCenter = GetWorldPosition(col, row);
-                    if (m_draggedObjOriginalBounds.Contains(cellCenter))
-                    {
-                        shouldOffset = true;
-                    }
+                    int index = col + row * m_columns;
+                    if (index >= 0 && index < m_draggedCoverage.Length)
+                        shouldOffset = m_draggedCoverage[index];
                 }
 
                 // 计算绘制位置
