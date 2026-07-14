@@ -28,18 +28,6 @@ public class LayerGridVisualizer : MonoBehaviour
     public int gridColumns = 10;
 
     /// <summary>
-    /// 是否显示网格线
-    /// </summary>
-    [Tooltip("是否显示网格线")]
-    public bool showGridLines = true;
-
-    /// <summary>
-    /// 网格线颜色
-    /// </summary>
-    [Tooltip("网格线颜色")]
-    public Color gridLineColor = Color.white;
-
-    /// <summary>
     /// Layer 对应的颜色映射
     /// </summary>
     [Header("Layer 颜色设置")]
@@ -77,7 +65,7 @@ public class LayerGridVisualizer : MonoBehaviour
     }
 
     /// <summary>
-    /// 绘制网格
+    /// 绘制网格（Layer 碰撞颜色填充）
     /// </summary>
     private void DrawGrid()
     {
@@ -89,19 +77,13 @@ public class LayerGridVisualizer : MonoBehaviour
         startPos.x -= (gridColumns * cellSize) * 0.5f;
         startPos.z -= (gridRows * cellSize) * 0.5f;
 
-        // 绘制每个单元格
+        // 绘制每个单元格（Layer 颜色填充）
         for (int row = 0; row < gridRows; row++)
         {
             for (int col = 0; col < gridColumns; col++)
             {
                 DrawCell(row, col, startPos);
             }
-        }
-
-        // 绘制网格线
-        if (showGridLines)
-        {
-            DrawGridLines(startPos);
         }
     }
 
@@ -126,34 +108,6 @@ public class LayerGridVisualizer : MonoBehaviour
         Gizmos.color = cellColor;
         Vector3 cellSize3D = new Vector3(cellSize, 0.01f, cellSize);
         Gizmos.DrawCube(cellCenter, cellSize3D);
-    }
-
-    /// <summary>
-    /// 绘制网格线
-    /// </summary>
-    /// <param name="startPos">网格起始位置</param>
-    private void DrawGridLines(Vector3 startPos)
-    {
-        Gizmos.color = gridLineColor;
-
-        float totalWidth = gridColumns * cellSize;
-        float totalHeight = gridRows * cellSize;
-
-        // 绘制垂直线
-        for (int col = 0; col <= gridColumns; col++)
-        {
-            Vector3 start = new Vector3(startPos.x + col * cellSize, startPos.y, startPos.z);
-            Vector3 end = new Vector3(startPos.x + col * cellSize, startPos.y, startPos.z + totalHeight);
-            Gizmos.DrawLine(start, end);
-        }
-
-        // 绘制水平线
-        for (int row = 0; row <= gridRows; row++)
-        {
-            Vector3 start = new Vector3(startPos.x, startPos.y, startPos.z + row * cellSize);
-            Vector3 end = new Vector3(startPos.x + totalWidth, startPos.y, startPos.z + row * cellSize);
-            Gizmos.DrawLine(start, end);
-        }
     }
 
     /// <summary>

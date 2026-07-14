@@ -203,14 +203,8 @@ public partial class LayerGridPainter
 
         // 用预分配缓冲区，避免每帧 GC
         Array.Clear(m_moved, 0, m_moved.Length);
-        // 复制当前网格到 nextGrid
-        for (int col = 0; col < m_columns; col++)
-        {
-            for (int row = 0; row < m_rows; row++)
-            {
-                m_nextGrid[col, row] = m_grid[col, row];
-            }
-        }
+        // 复制当前网格到 nextGrid（Array.Copy 比嵌套循环更快）
+        Array.Copy(m_grid, m_nextGrid, m_grid.Length);
         // 复制颜色网格
         if (m_liquidColorGrid != null && m_nextLiquidColorGrid != null)
         {

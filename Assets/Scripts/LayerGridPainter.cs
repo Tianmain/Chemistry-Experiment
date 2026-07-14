@@ -6,6 +6,22 @@ using UnityEditor;
 #endif
 
 /// <summary>
+/// 互阻规则：指定两个 Tag 之间互相阻碍
+/// </summary>
+[Serializable]
+public class MutualBlockRule
+{
+    [Tooltip("需要互相阻碍的 Tag A（如 Alcohol_Lamp）")]
+    public string tagA = "";
+
+    [Tooltip("需要互相阻碍的 Tag B（如 Tripod）")]
+    public string tagB = "";
+
+    [Tooltip("碰撞检测容差（distance 阈值，值越大越难触发碰撞）")]
+    public float collisionTolerance = 0f;
+}
+
+/// <summary>
 /// 水网格模拟器 - 基于网格的水流动模拟
 /// 检测场景中 Water Layer 的物体作为初始水源，水受到重力自然往下流
 /// 遇到 Obstacle Layer 的物体停止向下流动，可以向左/右流动
@@ -28,10 +44,6 @@ public partial class LayerGridPainter : MonoBehaviour
     public Color obstacleColor = new Color(1f, 0.3f, 0.3f, 0.8f);
 
     [Header("选项")]
-    [Tooltip("是否显示网格线")]
-    public bool showGridLines = true;
-    public Color gridLineColor = new Color(0, 0, 0, 0.4f);
-
     [Tooltip("是否启用水模拟")]
     public bool enableSimulation = true;
 
@@ -57,6 +69,15 @@ public partial class LayerGridPainter : MonoBehaviour
     [Tooltip("父子/同组可拖拽物体之间的碰撞穿透容差（世界单位），用于灯帽套合等场景")]
     public float parentChildCollisionTolerance = 0.2f;
 
+    [Tooltip("绝对不可穿透的 Tag 列表（所有物体都不能穿透）")]
+    public string[] impassableTags = { "Table" };
+
+    [Tooltip("全局可穿透的 Tag 列表（除非在当前拖拽物体的不可穿透列表中）")]
+    public string[] penetrableTags = { "Tripod" };
+
+    [Tooltip("互相阻碍的 Tag 对列表（如 Alcohol_Lamp 和 Tripod 会互相阻挡）")]
+    public MutualBlockRule[] mutualBlockRules;
+
     [Header("Layer 设置")]
     [Tooltip("障碍物 Layer 名称列表")]
     public string[] obstacleLayerNames = { "Obstacle" , "Equipment" };
@@ -64,16 +85,11 @@ public partial class LayerGridPainter : MonoBehaviour
     // 每个单元格在纹理中占多少像素
     private const int PIXELS_PER_CELL = 16;
 
-    // 可视化变量
-    private Texture2D gridTexture;
-    private Texture2D fillTexture;          // 填充纹理（修复泄漏：统一管理生命周期）
-    private Sprite gridSprite;
+    // 可视化变量（填充显示）
+    private Texture2D fillTexture;          // 填充纹理
     private Sprite fillSprite;              // 填充精灵
-    private GameObject gridObj;
-    private SpriteRenderer gridRenderer;
     private GameObject fillObj;
     private SpriteRenderer fillRenderer;
-    private Color[] pixelCache;
     private Color[] fillCache;
     private int cachedColumns = -1;
     private int cachedRows = -1;
@@ -106,8 +122,17 @@ public partial class LayerGridPainter : MonoBehaviour
     // 可拖拽 Tag 的 HashSet
     private HashSet<string> m_draggableTagSet;
 
+    // 可穿透 Tag 的 HashSet
+    private HashSet<string> m_penetrableTagSet;
+
+    // 绝对不可穿透 Tag 的 HashSet
+    private HashSet<string> m_impassableTagSet;
+
     // 预分配碰撞器缓冲区
     private Collider2D[] m_colliderBuffer = new Collider2D[128];
+
+    // 缓存碰撞过滤器，避免每帧重复构造（SetLayerMask 按需更新）
+    private ContactFilter2D m_contactFilter;
 
     // 拖拽状态
     private bool m_isDragging = false;
@@ -133,6 +158,7 @@ public partial class LayerGridPainter : MonoBehaviour
         RebuildDraggableTagSet();
         CreateVisualizerObject();
         InitializeGrid();
+        m_contactFilter = new ContactFilter2D();
     }
 
     private void OnEnable()
@@ -142,10 +168,6 @@ public partial class LayerGridPainter : MonoBehaviour
         CreateVisualizerObject();
         InitializeGrid();
         RebuildGrid();
-    }
-
-    private void OnDisable()
-    {
     }
 
     private void Update()
@@ -223,6 +245,8 @@ public partial class LayerGridPainter : MonoBehaviour
     private void RebuildDraggableTagSet()
     {
         m_draggableTagSet = new HashSet<string>(draggableTags ?? System.Array.Empty<string>());
+        m_penetrableTagSet = new HashSet<string>(penetrableTags ?? System.Array.Empty<string>());
+        m_impassableTagSet = new HashSet<string>(impassableTags ?? System.Array.Empty<string>());
     }
 
     /// <summary>
@@ -376,34 +400,7 @@ public partial class LayerGridPainter : MonoBehaviour
 
     private void CreateVisualizerObject()
     {
-        // 网格线对象（固定不动）
-        if (gridObj != null && gridRenderer != null)
-        {
-            gridObj.transform.localPosition = Vector3.zero;
-            gridObj.transform.localRotation = Quaternion.identity;
-        }
-        else
-        {
-            Transform existing = transform.Find("GridLines");
-            if (existing == null)
-            {
-                gridObj = new GameObject("GridLines");
-                gridObj.transform.SetParent(transform);
-                gridObj.transform.localPosition = Vector3.zero;
-                gridObj.transform.localRotation = Quaternion.identity;
-                gridRenderer = gridObj.AddComponent<SpriteRenderer>();
-                gridRenderer.sortingOrder = 100;
-            }
-            else
-            {
-                gridObj = existing.gameObject;
-                gridRenderer = gridObj.GetComponent<SpriteRenderer>();
-                if (gridRenderer == null)
-                    gridRenderer = gridObj.AddComponent<SpriteRenderer>();
-            }
-        }
-
-        // 填充对象（跟随拖拽移动）
+        // 填充对象
         if (fillObj != null && fillRenderer != null)
         {
             fillObj.transform.localPosition = Vector3.zero;
@@ -444,41 +441,14 @@ public partial class LayerGridPainter : MonoBehaviour
         int texWidth = columns * PIXELS_PER_CELL;
         int texHeight = rows * PIXELS_PER_CELL;
 
-        if (gridTexture == null || gridTexture.width != texWidth || gridTexture.height != texHeight)
+        if (fillCache == null || cachedColumns != columns || cachedRows != rows)
         {
-            if (gridTexture != null) DestroyImmediate(gridTexture);
-            gridTexture = new Texture2D(texWidth, texHeight, TextureFormat.RGBA32, false);
-            gridTexture.filterMode = FilterMode.Point;
-            gridTexture.wrapMode = TextureWrapMode.Clamp;
-        }
-
-        if (pixelCache == null || cachedColumns != columns || cachedRows != rows)
-        {
-            pixelCache = new Color[texWidth * texHeight];
             fillCache = new Color[texWidth * texHeight];
             cachedColumns = columns;
             cachedRows = rows;
         }
 
-        // 网格线 Sprite
-        if (gridSprite == null)
-        {
-            Rect rect = new Rect(0, 0, texWidth, texHeight);
-            Vector2 pivot = new Vector2(0.5f, 0.5f);
-            gridSprite = Sprite.Create(gridTexture, rect, pivot, 1f);
-
-            if (gridRenderer != null)
-            {
-                gridRenderer.sprite = gridSprite;
-                float scaleX = gridWidth / texWidth;
-                float scaleY = gridHeight / texHeight;
-                gridObj.transform.localScale = new Vector3(scaleX, scaleY, 1f);
-                gridObj.transform.localPosition = Vector3.zero;
-                gridObj.transform.localRotation = Quaternion.identity;
-            }
-        }
-
-        // 填充 Sprite — 复用纹理，避免内存泄漏
+        // 填充 Sprite
         if (fillObj != null && fillRenderer != null && fillCache != null)
         {
             // 尺寸变化时才重建纹理
@@ -499,49 +469,20 @@ public partial class LayerGridPainter : MonoBehaviour
                 fillRenderer.sprite = fillSprite;
             }
 
-            float scaleX2 = gridWidth / texWidth;
-            float scaleY2 = gridHeight / texHeight;
-            fillObj.transform.localScale = new Vector3(scaleX2, scaleY2, 1f);
+            float scaleX = gridWidth / texWidth;
+            float scaleY = gridHeight / texHeight;
+            fillObj.transform.localScale = new Vector3(scaleX, scaleY, 1f);
             fillObj.transform.localPosition = Vector3.zero;
             fillObj.transform.localRotation = Quaternion.identity;
         }
 
         m_isRebuilding = false;
 
-        // 网格线是静态的，只在 RebuildGrid 时绘制一次
-        DrawGridLines();
-
         RefreshColors();
-    }
-
-    /// <summary>
-    /// 绘制网格线到 gridTexture（仅在建表时调用）
-    /// </summary>
-    private void DrawGridLines()
-    {
-        if (gridTexture == null || pixelCache == null) return;
-
-        int columns = cachedColumns;
-        int rows = cachedRows;
-        int texWidth = columns * PIXELS_PER_CELL;
-        int texHeight = rows * PIXELS_PER_CELL;
-
-        Color transparent = new Color(0, 0, 0, 0);
-        for (int i = 0; i < pixelCache.Length; i++)
-            pixelCache[i] = transparent;
-
-        if (showGridLines)
-        {
-            DrawGridLinesToCache(pixelCache, texWidth, texHeight, columns, rows);
-        }
-
-        gridTexture.SetPixels(pixelCache);
-        gridTexture.Apply(false);
     }
 
     public void UpdateGrid()
     {
-        if (gridSprite != null) { DestroyImmediate(gridSprite); gridSprite = null; }
         if (fillSprite != null) { DestroyImmediate(fillSprite); fillSprite = null; }
         cachedColumns = -1;
         cachedRows = -1;
@@ -585,24 +526,21 @@ public partial class LayerGridPainter : MonoBehaviour
 
     private void RefreshColors()
     {
-        if ((gridTexture == null || pixelCache == null || fillCache == null) && !m_isRebuilding)
+        if ((fillTexture == null || fillCache == null) && !m_isRebuilding)
         {
             RebuildGrid();
             return;
         }
 
-        if (gridTexture == null || pixelCache == null || fillCache == null) return;
+        if (fillTexture == null || fillCache == null) return;
 
         int columns = cachedColumns;
         int rows = cachedRows;
         int texWidth = columns * PIXELS_PER_CELL;
         int texHeight = rows * PIXELS_PER_CELL;
 
-        Color transparent = new Color(0, 0, 0, 0);
-
-        // 清空填充缓存
-        for (int i = 0; i < fillCache.Length; i++)
-            fillCache[i] = transparent;
+        // 清空填充缓存（Array.Clear 比手动循环更快）
+        Array.Clear(fillCache, 0, fillCache.Length);
 
         // 绘制水和障碍物到填充缓存
         if (Application.isPlaying && m_grid != null)
@@ -619,29 +557,6 @@ public partial class LayerGridPainter : MonoBehaviour
         {
             fillTexture.SetPixels(fillCache);
             fillTexture.Apply(false);
-        }
-    }
-
-    private void DrawGridLinesToCache(Color[] pixels, int texWidth, int texHeight, int columns, int rows)
-    {
-        for (int col = 0; col <= columns; col++)
-        {
-            int x = col * PIXELS_PER_CELL;
-            if (x >= texWidth) x = texWidth - 1;
-            for (int y = 0; y < texHeight; y++)
-            {
-                pixels[y * texWidth + x] = gridLineColor;
-            }
-        }
-
-        for (int row = 0; row <= rows; row++)
-        {
-            int y = row * PIXELS_PER_CELL;
-            if (y >= texHeight) y = texHeight - 1;
-            for (int x = 0; x < texWidth; x++)
-            {
-                pixels[y * texWidth + x] = gridLineColor;
-            }
         }
     }
 
@@ -690,13 +605,11 @@ public partial class LayerGridPainter : MonoBehaviour
 
                 int startX = drawCol * PIXELS_PER_CELL;
                 int startY = drawRow * PIXELS_PER_CELL;
+                // Array.Fill 比嵌套循环更高效
                 for (int py = 0; py < PIXELS_PER_CELL; py++)
                 {
-                    int rowOffset = (startY + py) * texWidth;
-                    for (int px = 0; px < PIXELS_PER_CELL; px++)
-                    {
-                        fillCache[rowOffset + startX + px] = c;
-                    }
+                    int offset = (startY + py) * texWidth + startX;
+                    Array.Fill(fillCache, c, offset, PIXELS_PER_CELL);
                 }
             }
         }
@@ -741,13 +654,11 @@ public partial class LayerGridPainter : MonoBehaviour
 
                 int startX = col * PIXELS_PER_CELL;
                 int startY = row * PIXELS_PER_CELL;
+                // Array.Fill 比嵌套循环更高效
                 for (int py = 0; py < PIXELS_PER_CELL; py++)
                 {
-                    int rowOffset = (startY + py) * texWidth;
-                    for (int px = 0; px < PIXELS_PER_CELL; px++)
-                    {
-                        fillCache[rowOffset + startX + px] = c;
-                    }
+                    int offset = (startY + py) * texWidth + startX;
+                    Array.Fill(fillCache, c, offset, PIXELS_PER_CELL);
                 }
             }
         }
@@ -755,9 +666,7 @@ public partial class LayerGridPainter : MonoBehaviour
 
     private void OnDestroy()
     {
-        if (gridTexture != null) DestroyImmediate(gridTexture);
         if (fillTexture != null) DestroyImmediate(fillTexture);
-        if (gridSprite != null) DestroyImmediate(gridSprite);
         if (fillSprite != null) DestroyImmediate(fillSprite);
     }
 }

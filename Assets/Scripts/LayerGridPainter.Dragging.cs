@@ -1,8 +1,69 @@
+using System;
 using UnityEngine;
 using System.Collections.Generic;
 
 public partial class LayerGridPainter
 {
+    /// <summary>
+    /// 判断碰撞物体的 Tag 是否应该被忽略（可穿透）
+    /// 优先级：绝对不可穿透 > 互阻规则 > 拖拽物体本身可穿透 > 障碍物可穿透
+    /// </summary>
+    private bool ShouldIgnoreCollision(string obstacleTag)
+    {
+        if (string.IsNullOrEmpty(obstacleTag)) return false;
+
+        // 1. 绝对不可穿透：任何物体都不能穿过的障碍物
+        if (m_impassableTagSet != null && m_impassableTagSet.Contains(obstacleTag))
+            return false;
+
+        // 2. 互阻规则：两个 Tag 之间互相阻碍
+        if (m_draggedObject != null && mutualBlockRules != null)
+        {
+            string draggedTag = m_draggedObject.tag;
+            for (int i = 0; i < mutualBlockRules.Length; i++)
+            {
+                if (mutualBlockRules[i] == null) continue;
+                if ((mutualBlockRules[i].tagA == draggedTag && mutualBlockRules[i].tagB == obstacleTag)
+                 || (mutualBlockRules[i].tagA == obstacleTag && mutualBlockRules[i].tagB == draggedTag))
+                {
+                    return false; // 这两个 Tag 之间互相阻碍
+                }
+            }
+        }
+
+        // 4. 如果被拖拽的物体本身是可穿透的，那么它也可以穿过其他非绝对不可穿透的物体
+        if (m_draggedObject != null && m_penetrableTagSet != null && m_penetrableTagSet.Contains(m_draggedObject.tag))
+            return true;
+
+        // 5. 障碍物是可穿透的：别人穿过它时允许
+        if (m_penetrableTagSet != null && m_penetrableTagSet.Contains(obstacleTag))
+            return true;
+
+        return false;
+    }
+
+    /// <summary>
+    /// 获取当前拖拽物体对指定障碍物 Tag 的碰撞容差
+    /// 容差越大越难触发碰撞（需要更深的重叠才会被阻挡）
+    /// </summary>
+    private float GetCollisionTolerance(string obstacleTag)
+    {
+        if (m_draggedObject != null && mutualBlockRules != null)
+        {
+            string draggedTag = m_draggedObject.tag;
+            for (int i = 0; i < mutualBlockRules.Length; i++)
+            {
+                if (mutualBlockRules[i] == null) continue;
+                if ((mutualBlockRules[i].tagA == draggedTag && mutualBlockRules[i].tagB == obstacleTag)
+                 || (mutualBlockRules[i].tagA == obstacleTag && mutualBlockRules[i].tagB == draggedTag))
+                {
+                    return mutualBlockRules[i].collisionTolerance;
+                }
+            }
+        }
+        return 0f;
+    }
+
     /// <summary>
     /// 获取被拖拽物体自身及其所有子物体的碰撞器
     /// </summary>
@@ -58,18 +119,24 @@ public partial class LayerGridPainter
 
         foreach (var col in colliders)
         {
-            if (col == null) continue;
-            ContactFilter2D filter = new ContactFilter2D();
-            filter.SetLayerMask(m_combinedCollisionMask);
-            int count = Physics2D.OverlapCollider(col, filter, m_colliderBuffer);
+            if (col == null || col.isTrigger) continue;
+            m_contactFilter.SetLayerMask(m_combinedCollisionMask);
+            int count = Physics2D.OverlapCollider(col, m_contactFilter, m_colliderBuffer);
             for (int i = 0; i < count; i++)
             {
                 if (m_colliderBuffer[i] != null && m_colliderBuffer[i].gameObject != m_draggedObject)
                 {
+                    if (m_colliderBuffer[i].isTrigger)
+                        continue;
+                    if (ShouldIgnoreCollision(m_colliderBuffer[i].tag))
+                        continue;
+
                     bool isRelated = m_colliderBuffer[i].transform.IsChildOf(m_draggedObject.transform)
                                   || m_draggedObject.transform.IsChildOf(m_colliderBuffer[i].transform)
                                   || HasSameParent(m_draggedObject.transform, m_colliderBuffer[i].transform);
-                    float threshold = isRelated ? -parentChildCollisionTolerance : -0.001f;
+                    float baseThreshold = isRelated ? -parentChildCollisionTolerance : -0.001f;
+                    float tolerance = GetCollisionTolerance(m_colliderBuffer[i].tag);
+                    float threshold = baseThreshold - tolerance;
 
                     var dist = Physics2D.Distance(col, m_colliderBuffer[i]);
                     if (dist.isValid && dist.distance < threshold)
@@ -293,18 +360,24 @@ public partial class LayerGridPainter
                     Collider2D[] draggedCols = GetDraggedColliders();
                     foreach (var draggedCol in draggedCols)
                     {
-                        if (draggedCol == null) continue;
-                        ContactFilter2D filter2 = new ContactFilter2D();
-                        filter2.SetLayerMask(m_combinedCollisionMask);
-                        int count = Physics2D.OverlapCollider(draggedCol, filter2, m_colliderBuffer);
+                        if (draggedCol == null || draggedCol.isTrigger) continue;
+                        m_contactFilter.SetLayerMask(m_combinedCollisionMask);
+                        int count = Physics2D.OverlapCollider(draggedCol, m_contactFilter, m_colliderBuffer);
                         for (int i = 0; i < count; i++)
                         {
                             if (m_colliderBuffer[i] != null && m_colliderBuffer[i].gameObject != m_draggedObject)
                             {
+                                if (m_colliderBuffer[i].isTrigger)
+                                    continue;
+                                if (ShouldIgnoreCollision(m_colliderBuffer[i].tag))
+                                    continue;
+
                                 bool isRelated = m_colliderBuffer[i].transform.IsChildOf(m_draggedObject.transform)
                                               || m_draggedObject.transform.IsChildOf(m_colliderBuffer[i].transform)
                                               || HasSameParent(m_draggedObject.transform, m_colliderBuffer[i].transform);
-                                float threshold = isRelated ? -parentChildCollisionTolerance : -0.001f;
+                                float baseThreshold = isRelated ? -parentChildCollisionTolerance : -0.001f;
+                                float tol = GetCollisionTolerance(m_colliderBuffer[i].tag);
+                                float threshold = baseThreshold - tol;
 
                                 var dist = Physics2D.Distance(draggedCol, m_colliderBuffer[i]);
                                 if (dist.isValid && dist.distance < threshold)
@@ -414,12 +487,8 @@ public partial class LayerGridPainter
 
         if (offsetCol == 0 && offsetRow == 0) return;
 
-        Bounds originalBounds = m_draggedObjOriginalBounds;
-
-        // 复制 m_grid → m_nextGrid
-        for (int col = 0; col < m_columns; col++)
-            for (int row = 0; row < m_rows; row++)
-                m_nextGrid[col, row] = m_grid[col, row];
+        // 复制 m_grid → m_nextGrid（Array.Copy 比嵌套循环更快）
+        Array.Copy(m_grid, m_nextGrid, m_grid.Length);
 
         // 复制颜色网格
         if (m_liquidColorGrid != null && m_nextLiquidColorGrid != null)
