@@ -41,11 +41,11 @@ public partial class LayerGridPainter
 
                     if (hasObstacle && m_grid[col, row] != CellState.Obstacle)
                     {
-                        // 新障碍物出现 — 挤出水
-                        if (m_grid[col, row] == CellState.Water)
+                        // 新障碍物出现 — 挤出水或气泡
+                        if (m_grid[col, row] == CellState.Water || m_grid[col, row] == CellState.Bubble)
                         {
                             if (!TryMoveWaterNearby(col, row))
-                                continue; // 找不到空位，跳过，不覆盖水
+                                continue; // 找不到空位，跳过，不覆盖水/气泡
                         }
                         m_grid[col, row] = CellState.Obstacle;
                         m_liquidColorGrid[col, row] = Color.clear;
@@ -111,15 +111,15 @@ public partial class LayerGridPainter
                 }
                 if (!onTable) continue;
 
-                // Table 格本身有水 → 吸收
-                if (m_grid[col, row] == CellState.Water)
+                // Table 格本身有水或气泡 → 吸收
+                if (m_grid[col, row] == CellState.Water || m_grid[col, row] == CellState.Bubble)
                 {
                     m_grid[col, row] = CellState.Empty;
                     m_liquidColorGrid[col, row] = Color.clear;
                     absorbed = true;
                 }
-                // Table 格正上方有水 → 吸收
-                if (row + 1 < m_rows - 1 && m_grid[col, row + 1] == CellState.Water)
+                // Table 格正上方有水或气泡 → 吸收
+                if (row + 1 < m_rows - 1 && (m_grid[col, row + 1] == CellState.Water || m_grid[col, row + 1] == CellState.Bubble))
                 {
                     m_grid[col, row + 1] = CellState.Empty;
                     m_liquidColorGrid[col, row + 1] = Color.clear;
@@ -141,43 +141,46 @@ public partial class LayerGridPainter
     }
 
     /// <summary>
-    /// 尝试把水移到附近的空位置，返回是否成功
+    /// 尝试把水或气泡移到附近的空位置，返回是否成功
     /// </summary>
     private bool TryMoveWaterNearby(int col, int row)
     {
+        CellState originalState = m_grid[col, row];
+        Color originalColor = m_liquidColorGrid[col, row];
+
         // 向上
         if (row < m_rows - 1 && m_grid[col, row + 1] == CellState.Empty)
         {
-            m_grid[col, row + 1] = CellState.Water;
-            m_liquidColorGrid[col, row + 1] = m_liquidColorGrid[col, row];
+            m_grid[col, row + 1] = originalState;
+            m_liquidColorGrid[col, row + 1] = originalColor;
             return true;
         }
         // 向左
         if (col > 0 && m_grid[col - 1, row] == CellState.Empty)
         {
-            m_grid[col - 1, row] = CellState.Water;
-            m_liquidColorGrid[col - 1, row] = m_liquidColorGrid[col, row];
+            m_grid[col - 1, row] = originalState;
+            m_liquidColorGrid[col - 1, row] = originalColor;
             return true;
         }
         // 向右
         if (col < m_columns - 1 && m_grid[col + 1, row] == CellState.Empty)
         {
-            m_grid[col + 1, row] = CellState.Water;
-            m_liquidColorGrid[col + 1, row] = m_liquidColorGrid[col, row];
+            m_grid[col + 1, row] = originalState;
+            m_liquidColorGrid[col + 1, row] = originalColor;
             return true;
         }
         // 向上左
         if (row < m_rows - 1 && col > 0 && m_grid[col - 1, row + 1] == CellState.Empty)
         {
-            m_grid[col - 1, row + 1] = CellState.Water;
-            m_liquidColorGrid[col - 1, row + 1] = m_liquidColorGrid[col, row];
+            m_grid[col - 1, row + 1] = originalState;
+            m_liquidColorGrid[col - 1, row + 1] = originalColor;
             return true;
         }
         // 向上右
         if (row < m_rows - 1 && col < m_columns - 1 && m_grid[col + 1, row + 1] == CellState.Empty)
         {
-            m_grid[col + 1, row + 1] = CellState.Water;
-            m_liquidColorGrid[col + 1, row + 1] = m_liquidColorGrid[col, row];
+            m_grid[col + 1, row + 1] = originalState;
+            m_liquidColorGrid[col + 1, row + 1] = originalColor;
             return true;
         }
         return false;
@@ -212,6 +215,136 @@ public partial class LayerGridPainter
         }
 
         bool anyMoved = false;
+
+        // --- 气泡上浮模拟（在水流之前处理）---
+        // 气泡比水轻，会向上浮，穿过水体，到达水面后消失
+        // 从顶部向下遍历，确保每步每个气泡最多移动一次
+        if (enableBubbles)
+        {
+            // 根据气泡速度因子决定每步上浮几格（至少1格）
+            int bubbleSteps = Mathf.Max(1, Mathf.RoundToInt(bubbleRiseSpeed));
+
+            for (int step = 0; step < bubbleSteps; step++)
+            {
+                bool stepMoved = false;
+                for (int row = m_rows - 2; row >= 1; row--)
+                {
+                    for (int col = 1; col < m_columns - 1; col++)
+                    {
+                        if (m_nextGrid[col, row] != CellState.Bubble) continue;
+
+                        bool bubbleMoved = false;
+
+                        // 1. 优先正上方：如果是水，气泡和水交换位置（气泡上浮，水下沉）
+                        if (row < m_rows - 2 && !IsBoundaryCell(col, row + 1))
+                        {
+                            CellState above = m_nextGrid[col, row + 1];
+                            if (above == CellState.Water)
+                            {
+                                // 气泡上浮：气泡到上方，水到下方
+                                m_nextGrid[col, row + 1] = CellState.Bubble;
+                                m_nextGrid[col, row] = CellState.Water;
+                                // 水的颜色也跟随下沉
+                                m_nextLiquidColorGrid[col, row] = m_nextLiquidColorGrid[col, row + 1];
+                                m_nextLiquidColorGrid[col, row + 1] = Color.clear;
+                                bubbleMoved = true;
+                                stepMoved = true;
+                                anyMoved = true;
+                            }
+                            else if (above == CellState.Empty)
+                            {
+                                // 正上方是空（到达水面或水面以上）→ 气泡消失
+                                m_nextGrid[col, row] = CellState.Empty;
+                                m_nextLiquidColorGrid[col, row] = Color.clear;
+                                bubbleMoved = true;
+                                stepMoved = true;
+                                anyMoved = true;
+                            }
+                        }
+
+                        if (bubbleMoved) continue;
+
+                        // 2. 斜上方：左上方或右上方是水
+                        bool canLeftUp = row < m_rows - 2 && col > 1
+                            && m_nextGrid[col - 1, row + 1] == CellState.Water
+                            && !IsBoundaryCell(col - 1, row + 1);
+                        bool canRightUp = row < m_rows - 2 && col < m_columns - 2
+                            && m_nextGrid[col + 1, row + 1] == CellState.Water
+                            && !IsBoundaryCell(col + 1, row + 1);
+
+                        if (canLeftUp && canRightUp)
+                        {
+                            bool goLeft = UnityEngine.Random.value < 0.5f;
+                            int targetCol = goLeft ? col - 1 : col + 1;
+                            m_nextGrid[targetCol, row + 1] = CellState.Bubble;
+                            m_nextGrid[col, row] = CellState.Water;
+                            m_nextLiquidColorGrid[col, row] = m_nextLiquidColorGrid[targetCol, row + 1];
+                            m_nextLiquidColorGrid[targetCol, row + 1] = Color.clear;
+                            stepMoved = true;
+                            anyMoved = true;
+                        }
+                        else if (canLeftUp)
+                        {
+                            m_nextGrid[col - 1, row + 1] = CellState.Bubble;
+                            m_nextGrid[col, row] = CellState.Water;
+                            m_nextLiquidColorGrid[col, row] = m_nextLiquidColorGrid[col - 1, row + 1];
+                            m_nextLiquidColorGrid[col - 1, row + 1] = Color.clear;
+                            stepMoved = true;
+                            anyMoved = true;
+                        }
+                        else if (canRightUp)
+                        {
+                            m_nextGrid[col + 1, row + 1] = CellState.Bubble;
+                            m_nextGrid[col, row] = CellState.Water;
+                            m_nextLiquidColorGrid[col, row] = m_nextLiquidColorGrid[col + 1, row + 1];
+                            m_nextLiquidColorGrid[col + 1, row + 1] = Color.clear;
+                            stepMoved = true;
+                            anyMoved = true;
+                        }
+                        else
+                        {
+                            // 3. 水平方向：左右是水（气泡被上方物体挡住时横向漂移）
+                            bool canLeft = col > 1 && m_nextGrid[col - 1, row] == CellState.Water
+                                && !IsBoundaryCell(col - 1, row);
+                            bool canRight = col < m_columns - 2 && m_nextGrid[col + 1, row] == CellState.Water
+                                && !IsBoundaryCell(col + 1, row);
+
+                            if (canLeft && canRight)
+                            {
+                                bool goLeft = UnityEngine.Random.value < 0.5f;
+                                int targetCol = goLeft ? col - 1 : col + 1;
+                                m_nextGrid[targetCol, row] = CellState.Bubble;
+                                m_nextGrid[col, row] = CellState.Water;
+                                m_nextLiquidColorGrid[col, row] = m_nextLiquidColorGrid[targetCol, row];
+                                m_nextLiquidColorGrid[targetCol, row] = Color.clear;
+                                stepMoved = true;
+                                anyMoved = true;
+                            }
+                            else if (canLeft)
+                            {
+                                m_nextGrid[col - 1, row] = CellState.Bubble;
+                                m_nextGrid[col, row] = CellState.Water;
+                                m_nextLiquidColorGrid[col, row] = m_nextLiquidColorGrid[col - 1, row];
+                                m_nextLiquidColorGrid[col - 1, row] = Color.clear;
+                                stepMoved = true;
+                                anyMoved = true;
+                            }
+                            else if (canRight)
+                            {
+                                m_nextGrid[col + 1, row] = CellState.Bubble;
+                                m_nextGrid[col, row] = CellState.Water;
+                                m_nextLiquidColorGrid[col, row] = m_nextLiquidColorGrid[col + 1, row];
+                                m_nextLiquidColorGrid[col + 1, row] = Color.clear;
+                                stepMoved = true;
+                                anyMoved = true;
+                            }
+                        }
+                    }
+                }
+                // 如果这一步没有任何气泡移动，提前退出（后面的步也不会有变化）
+                if (!stepMoved) break;
+            }
+        }
 
         for (int row = 0; row < m_rows; row++)
         {
@@ -359,8 +492,13 @@ public partial class LayerGridPainter
             }
         }
 
+        // --- 液体混合扩散 pass ---
+        // 相邻不同颜色的水格子逐渐混合颜色（扩散）
+        if (mixingDiffusionRate > 0f && mixingColorThreshold >= 0f)
+            DiffuseColors();
+
         // 只有水实际移动了才交换和标记 dirty
-        if (anyMoved)
+        if (anyMoved || m_colorDiffused)
         {
             var temp = m_grid;
             m_grid = m_nextGrid;
@@ -372,5 +510,68 @@ public partial class LayerGridPainter
 
             m_isDirty = true;
         }
+        m_colorDiffused = false;
     }
+
+    /// <summary>
+    /// 液体颜色扩散混合：相邻水格子颜色逐渐趋同
+    /// 仅对颜色差异超过阈值的相邻水格子执行插值混合
+    /// </summary>
+    private void DiffuseColors()
+    {
+        // 预算方向偏移（右、左、上、下）
+        int[] dcol = { 1, -1, 0, 0 };
+        int[] drow = { 0, 0, 1, -1 };
+
+        for (int row = 1; row < m_rows - 1; row++)
+        {
+            for (int col = 1; col < m_columns - 1; col++)
+            {
+                if (m_nextGrid[col, row] != CellState.Water) continue;
+
+                Color srcColor = m_nextLiquidColorGrid[col, row];
+                float rSum = 0f, gSum = 0f, bSum = 0f, aSum = 0f;
+                int neighborCount = 0;
+
+                for (int d = 0; d < 4; d++)
+                {
+                    int nc = col + dcol[d];
+                    int nr = row + drow[d];
+                    if (nc <= 0 || nc >= m_columns - 1 || nr <= 0 || nr >= m_rows - 1) continue;
+                    if (m_nextGrid[nc, nr] != CellState.Water) continue;
+
+                    Color neighborColor = m_nextLiquidColorGrid[nc, nr];
+                    // 颜色差异检测
+                    float diff = Mathf.Abs(srcColor.r - neighborColor.r)
+                               + Mathf.Abs(srcColor.g - neighborColor.g)
+                               + Mathf.Abs(srcColor.b - neighborColor.b);
+                    if (diff > mixingColorThreshold)
+                    {
+                        rSum += neighborColor.r;
+                        gSum += neighborColor.g;
+                        bSum += neighborColor.b;
+                        aSum += neighborColor.a;
+                        neighborCount++;
+                    }
+                }
+
+                if (neighborCount > 0)
+                {
+                    float avgR = rSum / neighborCount;
+                    float avgG = gSum / neighborCount;
+                    float avgB = bSum / neighborCount;
+                    float avgA = aSum / neighborCount;
+
+                    m_nextLiquidColorGrid[col, row].r = Mathf.Lerp(srcColor.r, avgR, mixingDiffusionRate);
+                    m_nextLiquidColorGrid[col, row].g = Mathf.Lerp(srcColor.g, avgG, mixingDiffusionRate);
+                    m_nextLiquidColorGrid[col, row].b = Mathf.Lerp(srcColor.b, avgB, mixingDiffusionRate);
+                    m_nextLiquidColorGrid[col, row].a = Mathf.Lerp(srcColor.a, avgA, mixingDiffusionRate);
+                    m_colorDiffused = true;
+                }
+            }
+        }
+    }
+
+    // 标记本次模拟是否有颜色扩散变化
+    private bool m_colorDiffused;
 }

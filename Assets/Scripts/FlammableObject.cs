@@ -54,19 +54,13 @@ public class FlammableObject : MonoBehaviour
     public void Ignite()
     {
         if (fireObject != null && !fireObject.activeSelf)
-        {
-            // Debug.Log($"[FlammableObject] {name} 被点燃");
             fireObject.SetActive(true);
-        }
     }
 
     public void Extinguish()
     {
         if (fireObject != null && fireObject.activeSelf)
-        {
-            // Debug.Log($"[FlammableObject] {name} 被熄灭");
             fireObject.SetActive(false);
-        }
         m_burnTimer = 0f;
     }
 }

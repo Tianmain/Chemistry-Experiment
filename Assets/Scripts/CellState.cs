@@ -2,5 +2,6 @@ public enum CellState
 {
     Empty,
     Water,
-    Obstacle
+    Obstacle,
+    Bubble
 }

@@ -19,6 +19,15 @@ public class IgniterController : MonoBehaviour
     private Vector3 m_positionOnMouseDown;
 
     private Collider2D[] m_fireOverlapBuffer = new Collider2D[16];
+    private ContactFilter2D m_fireContactFilter;
+    private Camera m_cachedCamera;
+
+    private void Awake()
+    {
+        m_fireContactFilter = new ContactFilter2D();
+        m_fireContactFilter.useTriggers = true;
+        m_fireContactFilter.SetLayerMask(Physics2D.AllLayers);
+    }
 
     private void Update()
     {
@@ -59,20 +68,7 @@ public class IgniterController : MonoBehaviour
     /// </summary>
     private void TransferFire()
     {
-        ContactFilter2D filter = new ContactFilter2D();
-        filter.useTriggers = true;
-        filter.SetLayerMask(Physics2D.AllLayers);
-
-        int count = Physics2D.OverlapCollider(fireAreaCollider, filter, m_fireOverlapBuffer);
-        // if (count > 0)
-        // {
-        //     Debug.Log($"[Igniter] OverlapCollider 检测到 {count} 个碰撞体:");
-        //     for (int i = 0; i < count; i++)
-        //     {
-        //         if (m_fireOverlapBuffer[i] != null)
-        //             Debug.Log($"  - [{i}] {m_fireOverlapBuffer[i].name} (on {m_fireOverlapBuffer[i].transform.root.name})");
-        //     }
-        // }
+        int count = Physics2D.OverlapCollider(fireAreaCollider, m_fireContactFilter, m_fireOverlapBuffer);
         for (int i = 0; i < count; i++)
         {
             Collider2D other = m_fireOverlapBuffer[i];
@@ -82,29 +78,20 @@ public class IgniterController : MonoBehaviour
             // 优先在碰撞体所在物体上查找 FlammableObject，否则向上查找
             FlammableObject flammable = other.GetComponent<FlammableObject>();
             if (flammable == null)
-            {
                 flammable = other.GetComponentInParent<FlammableObject>();
-            }
 
-            if (flammable != null)
-            {
-                // Debug.Log($"[Igniter] 找到 FlammableObject: {flammable.name}, IsIgnited={flammable.IsIgnited}");
-                if (!flammable.IsIgnited)
-                {
-                    // Debug.Log($"[Igniter] 调用 {flammable.name}.Ignite()");
-                    flammable.Ignite();
-                }
-            }
+            if (flammable != null && !flammable.IsIgnited)
+                flammable.Ignite();
         }
     }
 
     private Vector2 GetMouseWorldPos()
     {
-        if (Camera.main != null)
-        {
-            return Camera.main.ScreenToWorldPoint(Input.mousePosition);
-        }
-        return Vector2.zero;
+        if (m_cachedCamera == null)
+            m_cachedCamera = Camera.main;
+        if (m_cachedCamera == null)
+            return Vector2.zero;
+        return m_cachedCamera.ScreenToWorldPoint(Input.mousePosition);
     }
 
     private bool IsPointInTrigger(Vector2 point)
@@ -121,17 +108,13 @@ public class IgniterController : MonoBehaviour
     public void Extinguish()
     {
         if (fireObject != null && fireObject.activeSelf)
-        {
             fireObject.SetActive(false);
-        }
     }
 
     private void ToggleFire()
     {
         if (fireObject != null)
-        {
             fireObject.SetActive(!fireObject.activeSelf);
-        }
     }
 
     private void OnDisable()

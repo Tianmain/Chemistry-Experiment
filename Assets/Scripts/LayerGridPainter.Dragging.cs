@@ -65,12 +65,21 @@ public partial class LayerGridPainter
     }
 
     /// <summary>
-    /// 获取被拖拽物体自身及其所有子物体的碰撞器
+    /// 获取被拖拽物体自身及其所有子物体的非 Trigger 碰撞器
     /// </summary>
     private Collider2D[] GetDraggedColliders()
     {
         if (m_draggedObject == null) return System.Array.Empty<Collider2D>();
-        return m_draggedObject.GetComponentsInChildren<Collider2D>();
+        Collider2D[] all = m_draggedObject.GetComponentsInChildren<Collider2D>();
+        int count = 0;
+        for (int i = 0; i < all.Length; i++)
+            if (all[i] != null && !all[i].isTrigger) count++;
+        if (count == 0) return System.Array.Empty<Collider2D>();
+        Collider2D[] result = new Collider2D[count];
+        int idx = 0;
+        for (int i = 0; i < all.Length; i++)
+            if (all[i] != null && !all[i].isTrigger) result[idx++] = all[i];
+        return result;
     }
 
     /// <summary>
@@ -84,13 +93,17 @@ public partial class LayerGridPainter
     }
 
     /// <summary>
-    /// 在拖拽开始时缓存每个格子是否被被拖拽物体覆盖（基于原始位置）
+    /// 在拖拽开始时缓存每个格子是否被被拖拽物体覆盖（基于原始位置）。
+    /// 碰撞器直接覆盖的格子（容器壁）始终缓存；
+    /// 容器内的水通过 LiquidSource 的区域碰撞器检测，使液体跟随拖拽同步移动。
     /// </summary>
-    private void CacheDraggedCoverage()
+    public void CacheDraggedCoverage()
     {
         if (m_draggedObjColliders == null || m_columns <= 0 || m_rows <= 0) return;
 
         m_draggedCoverage = new bool[m_columns * m_rows];
+
+        // 1. 缓存碰撞器直接覆盖的格子（容器壁）
         for (int row = 0; row < m_rows; row++)
         {
             for (int col = 0; col < m_columns; col++)
@@ -98,12 +111,55 @@ public partial class LayerGridPainter
                 Vector2 cellCenter = GetWorldPosition(col, row);
                 foreach (var draggedCol in m_draggedObjColliders)
                 {
-                    if (draggedCol != null && draggedCol.OverlapPoint(cellCenter))
+                    if (draggedCol != null && !draggedCol.isTrigger && draggedCol.OverlapPoint(cellCenter))
                     {
                         m_draggedCoverage[col + row * m_columns] = true;
                         break;
                     }
                 }
+            }
+        }
+
+        // 2. 查找物体及其子物体中的所有 LiquidSource
+        if (m_draggedObject == null) return;
+        LiquidSource[] liquidSources = m_draggedObject.GetComponentsInChildren<LiquidSource>();
+        if (liquidSources == null || liquidSources.Length == 0) return;
+
+        // 3. 通过 LiquidSource 的区域碰撞器检测容器内的水格子
+        //    同时：如果 Water 格子正下方是被拖拽物体覆盖的格子（杯底），也标记为跟随
+        //    （防止最底层水因 LiquidSource 碰撞器边界漏检而留在原地）
+        for (int row = 1; row < m_rows - 1; row++)
+        {
+            for (int col = 1; col < m_columns - 1; col++)
+            {
+                // 水和气泡都需要跟随容器拖拽
+                if (m_grid[col, row] != CellState.Water && m_grid[col, row] != CellState.Bubble) continue;
+                int idx = col + row * m_columns;
+                if (m_draggedCoverage[idx]) continue;
+
+                Vector2 cellCenter = GetWorldPosition(col, row);
+                bool shouldMark = false;
+
+                // LiquidSource 区域检测
+                foreach (var ls in liquidSources)
+                {
+                    if (ls != null && ls.ContainsPoint(cellCenter))
+                    {
+                        shouldMark = true;
+                        break;
+                    }
+                }
+
+                // 正下方是被拖拽物体覆盖的格子（杯底）
+                if (!shouldMark && row > 0)
+                {
+                    int belowIdx = col + (row - 1) * m_columns;
+                    if (m_draggedCoverage[belowIdx])
+                        shouldMark = true;
+                }
+
+                if (shouldMark)
+                    m_draggedCoverage[idx] = true;
             }
         }
     }
@@ -245,7 +301,7 @@ public partial class LayerGridPainter
             Collider2D targetHit = null;
             foreach (var h in hits)
             {
-                if (h != null && m_draggableTagSet.Contains(h.tag))
+                if (h != null && !h.isTrigger && m_draggableTagSet.Contains(h.tag))
                 {
                     targetHit = h;
                     break;
@@ -285,8 +341,8 @@ public partial class LayerGridPainter
                 m_draggedCollider = targetHit;
                 m_lastValidDragPos = m_dragStartObjPos;
 
-                // 计算被拖拽物体及其所有子碰撞器的总 Bounds，确保所有子物体网格都参与偏移
-                Collider2D[] allColliders = m_draggedObject.GetComponentsInChildren<Collider2D>();
+                // 计算被拖拽物体及其所有子物体的非 Trigger 碰撞器的总 Bounds，确保所有子物体网格都参与偏移
+                Collider2D[] allColliders = GetDraggedColliders();
                 m_draggedObjColliders = allColliders;
                 if (allColliders.Length > 0)
                 {
@@ -434,8 +490,6 @@ public partial class LayerGridPainter
                     m_lastValidDragPos = allowedPos;
                 }
 
-                m_draggedObject.transform.rotation = m_dragStartObjRot;
-
                 // 用实际有效偏移量更新（而非原始鼠标偏移）
                 m_dragOffsetX = m_lastValidDragPos.x - m_dragStartObjPos.x;
                 m_dragOffsetY = m_lastValidDragPos.y - m_dragStartObjPos.y;
@@ -444,7 +498,6 @@ public partial class LayerGridPainter
             {
                 m_draggedObject.transform.position = smoothedPos;
                 m_lastValidDragPos = smoothedPos;
-                m_draggedObject.transform.rotation = m_dragStartObjRot;
 
                 m_dragOffsetX = m_lastValidDragPos.x - m_dragStartObjPos.x;
                 m_dragOffsetY = m_lastValidDragPos.y - m_dragStartObjPos.y;
@@ -512,19 +565,9 @@ public partial class LayerGridPainter
             {
                 if (m_grid[col, row] == CellState.Empty) continue;
 
-                Vector2 cellCenter = GetWorldPosition(col, row);
-                bool isInsideDraggedObject = false;
-                if (m_draggedObjColliders != null)
-                {
-                    foreach (var draggedCol in m_draggedObjColliders)
-                    {
-                        if (draggedCol != null && draggedCol.OverlapPoint(cellCenter))
-                        {
-                            isInsideDraggedObject = true;
-                            break;
-                        }
-                    }
-                }
+                // 使用拖拽开始时缓存的覆盖状态（包含碰撞器覆盖 + 容器内部封闭的水）
+                int idx = col + row * m_columns;
+                bool isInsideDraggedObject = m_draggedCoverage != null && idx >= 0 && idx < m_draggedCoverage.Length && m_draggedCoverage[idx];
                 if (!isInsideDraggedObject) continue;
 
                 int newCol = col + offsetCol;

@@ -42,6 +42,17 @@ public partial class LayerGridPainter : MonoBehaviour
     [Header("颜色设置")]
     public Color waterColor = new Color(0.2f, 0.5f, 1f, 0.6f);
     public Color obstacleColor = new Color(1f, 0.3f, 0.3f, 0.8f);
+    public Color bubbleColor = new Color(1f, 1f, 1f, 0.9f);
+
+    [Header("气泡效果")]
+    [Tooltip("是否启用蒸发气泡效果")]
+    public bool enableBubbles = true;
+    [Tooltip("每次蒸发时生成气泡的概率（0~1）")]
+    [Range(0f, 1f)]
+    public float bubbleSpawnChance = 0.7f;
+    [Tooltip("气泡上浮速度因子（值越大上浮越快）")]
+    [Range(0.5f, 3f)]
+    public float bubbleRiseSpeed = 1.2f;
 
     [Header("选项")]
     [Tooltip("是否启用水模拟")]
@@ -77,6 +88,15 @@ public partial class LayerGridPainter : MonoBehaviour
 
     [Tooltip("互相阻碍的 Tag 对列表（如 Alcohol_Lamp 和 Tripod 会互相阻挡）")]
     public MutualBlockRule[] mutualBlockRules;
+
+    [Header("液体混合")]
+    [Tooltip("液体混合扩散速率（0=不混合，0.1=每步向邻居颜色靠近10%）")]
+    [Range(0f, 0.5f)]
+    public float mixingDiffusionRate = 0.08f;
+
+    [Tooltip("颜色差异阈值（RGB分量差值之和低于此值不触发混合）")]
+    [Range(0f, 0.2f)]
+    public float mixingColorThreshold = 0.02f;
 
     [Header("Layer 设置")]
     [Tooltip("障碍物 Layer 名称列表")]
@@ -148,6 +168,16 @@ public partial class LayerGridPainter : MonoBehaviour
     private Collider2D[] m_draggedObjColliders; // 被拖拽物体的碰撞器缓存（用于精确偏移格子）
     private bool[] m_draggedCoverage; // 拖拽开始时缓存的格子覆盖状态（原始位置）
 
+    /// <summary>
+    /// 当前是否正在拖拽物体
+    /// </summary>
+    public bool IsDragging => m_isDragging;
+
+    /// <summary>
+    /// 当前被拖拽的物体（未拖拽时为 null）
+    /// </summary>
+    public GameObject DraggedObject => m_draggedObject;
+
     // 液体颜色网格（与 m_grid 并行，仅对 Water 格子有效）
     private Color[,] m_liquidColorGrid;
     private Color[,] m_nextLiquidColorGrid;
@@ -187,23 +217,23 @@ public partial class LayerGridPainter : MonoBehaviour
 
                 m_updateTimer += Time.deltaTime;
                 if (m_updateTimer >= updateInterval)
-                {
-                    m_updateTimer = 0f;
-
-                    if (trackObjectMovement)
                     {
-                        UpdateGridFromObjects();
-                    }
+                        m_updateTimer = 0f;
 
-                    if (enableSimulation)
-                    {
-                        int steps = Mathf.Max(1, simulationStepsPerTick);
-                        for (int i = 0; i < steps; i++)
+                        if (trackObjectMovement)
                         {
-                            ProcessWaterSimulation();
+                            UpdateGridFromObjects();
+                        }
+
+                        if (enableSimulation)
+                        {
+                            int steps = Mathf.Max(1, simulationStepsPerTick);
+                            for (int i = 0; i < steps; i++)
+                            {
+                                ProcessWaterSimulation();
+                            }
                         }
                     }
-                }
             }
         }
 
@@ -490,18 +520,275 @@ public partial class LayerGridPainter : MonoBehaviour
         RebuildGrid();
     }
 
+    // 预分配的随机水格索引缓冲区（避免每帧 GC）
+    private int[] m_randomWaterBuffer = new int[256];
+
     /// <summary>
-    /// 从指定碰撞体区域内移除一格水（优先移除最上方的水格）
+    /// 从指定碰撞体区域内移除一格水（从最底部水格中随机选择一个移除，模拟底部均匀蒸发）
+    /// 蒸发后会在原处或附近随机生成气泡，气泡会上浮穿过水体，模拟沸腾效果
     /// </summary>
     /// <returns>是否成功移除了一格水</returns>
     public bool RemoveWaterFromRegion(Collider2D[] regionColliders)
     {
         if (m_grid == null || regionColliders == null || regionColliders.Length == 0) return false;
 
-        // 优先移除最上方的水格（从顶部向下搜索）
-        for (int row = m_rows - 2; row >= 1; row--)
+        // Step 1: 先找到网格中真正有水的最底行（不依赖区域碰撞器，避免边界漏检）
+        int trueBottomRow = -1;
+        for (int row = 1; row < m_rows - 1; row++)
         {
             for (int col = 1; col < m_columns - 1; col++)
+            {
+                if (m_grid[col, row] == CellState.Water || m_grid[col, row] == CellState.Bubble)
+                {
+                    trueBottomRow = row;
+                    break;
+                }
+            }
+            if (trueBottomRow >= 0) break;
+        }
+
+        if (trueBottomRow < 0) return false;
+
+        // Step 2: 从真正的最底行开始，逐行向上找，收集在区域内的水格
+        int bottomRow = -1;
+        int waterCount = 0;
+
+        for (int row = trueBottomRow; row < m_rows - 1; row++)
+        {
+            for (int col = 1; col < m_columns - 1; col++)
+            {
+                if (m_grid[col, row] != CellState.Water) continue;
+
+                Vector2 worldPos = new Vector2(
+                    m_originX + (col + 0.5f) * cellSize,
+                    m_originY + (row + 0.5f) * cellSize);
+
+                bool inRegion = false;
+                foreach (var colld in regionColliders)
+                {
+                    if (colld != null && colld.OverlapPoint(worldPos))
+                    {
+                        inRegion = true;
+                        break;
+                    }
+                }
+
+                if (inRegion)
+                {
+                    if (bottomRow < 0) bottomRow = row;
+                    if (row == bottomRow)
+                    {
+                        if (waterCount >= m_randomWaterBuffer.Length)
+                        {
+                            Array.Resize(ref m_randomWaterBuffer, m_randomWaterBuffer.Length * 2);
+                        }
+                        m_randomWaterBuffer[waterCount] = col;
+                        waterCount++;
+                    }
+                }
+            }
+
+            // 找到了最底行且已收集到水格，就不用再往上找了
+            if (bottomRow >= 0 && waterCount > 0)
+                break;
+        }
+
+        if (waterCount == 0) return false;
+
+        // Step 3: 从最底部的水格中随机选一个移除
+        int randomIdx = UnityEngine.Random.Range(0, waterCount);
+        int selectedCol = m_randomWaterBuffer[randomIdx];
+        int selectedRow = bottomRow;
+
+        m_grid[selectedCol, selectedRow] = CellState.Empty;
+        m_liquidColorGrid[selectedCol, selectedRow] = Color.clear;
+
+        // Step 4: 蒸发后尝试在附近随机生成气泡（优先同一行左右两侧，确保气泡从最底层上浮）
+        if (enableBubbles && UnityEngine.Random.value < bubbleSpawnChance)
+        {
+            SpawnBubbleNearby(selectedCol, selectedRow, regionColliders);
+        }
+
+        m_isDirty = true;
+        return true;
+    }
+
+    // 预分配的气泡候选位置数组（同一行左右两侧优先，确保气泡从最底层开始上浮）
+    // 分组 0：同一行（左、右）—— 最优先，气泡从最底层开始上浮
+    // 分组 1：斜上方（左上、右上）—— 次优先
+    // 分组 2：正上方 —— 最后考虑
+    private int[,] m_bubbleCandidateOffsets = new int[,]
+    {
+        { -1, 0 }, { 1, 0 },     // 分组 0：同一行左右
+        { -1, 1 }, { 1, 1 },     // 分组 1：斜上方
+        { 0, 1 }                   // 分组 2：正上方
+    };
+    private int[] m_bubbleShuffleIndices = new int[5] { 0, 1, 2, 3, 4 };
+
+    /// <summary>
+    /// 在指定位置附近随机生成一个气泡（在水格中）
+    /// 优先在同一行左右两侧生成（确保气泡从最底层开始上浮），
+    /// 同一优先级内随机打乱顺序。
+    /// </summary>
+    private void SpawnBubbleNearby(int col, int row, Collider2D[] regionColliders)
+    {
+        // 按优先级分组尝试：组内随机，组间有序
+        int[][] groups = new int[][]
+        {
+            new int[] { 0, 1 },    // 分组 0：同一行左右（最优先）
+            new int[] { 2, 3 },    // 分组 1：斜上方
+            new int[] { 4 }         // 分组 2：正上方
+        };
+
+        foreach (var group in groups)
+        {
+            // 组内 Fisher-Yates 洗牌
+            for (int i = group.Length - 1; i > 0; i--)
+            {
+                int j = UnityEngine.Random.Range(0, i + 1);
+                int tmp = group[i];
+                group[i] = group[j];
+                group[j] = tmp;
+            }
+
+            // 按随机顺序尝试该组的候选位置
+            foreach (int idx in group)
+            {
+                int tc = col + m_bubbleCandidateOffsets[idx, 0];
+                int tr = row + m_bubbleCandidateOffsets[idx, 1];
+
+                if (tc <= 0 || tc >= m_columns - 1 || tr <= 0 || tr >= m_rows - 1) continue;
+                if (IsBoundaryCell(tc, tr)) continue;
+
+                // 气泡必须生成在水格中（被水包围才能上浮）
+                if (m_grid[tc, tr] != CellState.Water) continue;
+
+                // 确保在蒸发区域内
+                Vector2 worldPos = GetWorldPosition(tc, tr);
+                bool inRegion = false;
+                foreach (var colld in regionColliders)
+                {
+                    if (colld != null && colld.OverlapPoint(worldPos))
+                    {
+                        inRegion = true;
+                        break;
+                    }
+                }
+                if (!inRegion) continue;
+
+                // 生成气泡：将该水格变成气泡（气泡会在下一次物理模拟时上浮）
+                m_grid[tc, tr] = CellState.Bubble;
+                return;
+            }
+        }
+    }
+
+    // 预分配的气泡生成位置缓冲区
+    private int[] m_bubbleSpawnColBuffer = new int[256];
+    private int[] m_bubbleSpawnRowBuffer = new int[256];
+
+    /// <summary>
+    /// 在指定区域内的最底层水格中随机生成指定数量的气泡
+    /// 用于沸腾强度增加时批量生成气泡
+    /// </summary>
+    /// <param name="regionColliders">蒸发区域碰撞体</param>
+    /// <param name="count">要生成的气泡数量</param>
+    public void SpawnBubblesInRegion(Collider2D[] regionColliders, int count)
+    {
+        if (!enableBubbles || m_grid == null || regionColliders == null || regionColliders.Length == 0 || count <= 0) return;
+
+        // Step 1: 收集最底部 1~3 行所有在区域内的水格作为气泡候选
+        int trueBottomRow = -1;
+        for (int row = 1; row < m_rows - 1; row++)
+        {
+            for (int col = 1; col < m_columns - 1; col++)
+            {
+                if (m_grid[col, row] == CellState.Water)
+                {
+                    trueBottomRow = row;
+                    break;
+                }
+            }
+            if (trueBottomRow >= 0) break;
+        }
+
+        if (trueBottomRow < 0) return;
+
+        // 收集底部 3 行的水格（给气泡更多生成位置）
+        int candidateCount = 0;
+        int maxScanRow = Mathf.Min(trueBottomRow + 3, m_rows - 1);
+
+        for (int row = trueBottomRow; row < maxScanRow; row++)
+        {
+            for (int col = 1; col < m_columns - 1; col++)
+            {
+                if (m_grid[col, row] != CellState.Water) continue;
+
+                Vector2 worldPos = GetWorldPosition(col, row);
+                bool inRegion = false;
+                foreach (var colld in regionColliders)
+                {
+                    if (colld != null && colld.OverlapPoint(worldPos))
+                    {
+                        inRegion = true;
+                        break;
+                    }
+                }
+                if (!inRegion) continue;
+
+                if (candidateCount >= m_bubbleSpawnColBuffer.Length)
+                {
+                    Array.Resize(ref m_bubbleSpawnColBuffer, m_bubbleSpawnColBuffer.Length * 2);
+                    Array.Resize(ref m_bubbleSpawnRowBuffer, m_bubbleSpawnRowBuffer.Length * 2);
+                }
+                m_bubbleSpawnColBuffer[candidateCount] = col;
+                m_bubbleSpawnRowBuffer[candidateCount] = row;
+                candidateCount++;
+            }
+        }
+
+        if (candidateCount == 0) return;
+
+        // Step 2: 随机选择候选位置生成气泡（不重复选择同一位置）
+        int spawnCount = Mathf.Min(count, candidateCount);
+
+        // Fisher-Yates 洗牌前 N 个位置
+        for (int i = 0; i < spawnCount; i++)
+        {
+            int j = UnityEngine.Random.Range(i, candidateCount);
+            if (i != j)
+            {
+                int tmpCol = m_bubbleSpawnColBuffer[i];
+                int tmpRow = m_bubbleSpawnRowBuffer[i];
+                m_bubbleSpawnColBuffer[i] = m_bubbleSpawnColBuffer[j];
+                m_bubbleSpawnRowBuffer[i] = m_bubbleSpawnRowBuffer[j];
+                m_bubbleSpawnColBuffer[j] = tmpCol;
+                m_bubbleSpawnRowBuffer[j] = tmpRow;
+            }
+
+            int bc = m_bubbleSpawnColBuffer[i];
+            int br = m_bubbleSpawnRowBuffer[i];
+            if (m_grid[bc, br] == CellState.Water)
+            {
+                m_grid[bc, br] = CellState.Bubble;
+            }
+        }
+
+        if (spawnCount > 0)
+            m_isDirty = true;
+    }
+
+    /// <summary>
+    /// 统计指定碰撞体区域内的水格总数
+    /// </summary>
+    public int GetWaterCountInRegion(Collider2D[] regionColliders)
+    {
+        if (m_grid == null || regionColliders == null || regionColliders.Length == 0) return 0;
+
+        int count = 0;
+        for (int row = 0; row < m_rows; row++)
+        {
+            for (int col = 0; col < m_columns; col++)
             {
                 if (m_grid[col, row] != CellState.Water) continue;
 
@@ -513,15 +800,13 @@ public partial class LayerGridPainter : MonoBehaviour
                 {
                     if (colld != null && colld.OverlapPoint(worldPos))
                     {
-                        m_grid[col, row] = CellState.Empty;
-                        m_liquidColorGrid[col, row] = Color.clear;
-                        m_isDirty = true;
-                        return true;
+                        count++;
+                        break;
                     }
                 }
             }
         }
-        return false;
+        return count;
     }
 
     private void RefreshColors()
@@ -574,12 +859,19 @@ public partial class LayerGridPainter : MonoBehaviour
             for (int col = 0; col < columns; col++)
             {
                 Color c = Color.clear;
+                bool isBubble = false;
                 if (m_grid[col, row] == CellState.Water)
                 {
                     // 优先使用 LiquidSource 定义的自定义颜色，未定义则回退到默认 waterColor
                     c = m_liquidColorGrid[col, row];
                     if (c == Color.clear || c.a <= 0.001f)
                         c = waterColor;
+                }
+                else if (m_grid[col, row] == CellState.Bubble)
+                {
+                    // 气泡：先绘制背景水色，再叠加白色气泡圆点
+                    c = waterColor;
+                    isBubble = true;
                 }
                 else if (m_grid[col, row] == CellState.Obstacle)
                     c = obstacleColor;
@@ -605,11 +897,41 @@ public partial class LayerGridPainter : MonoBehaviour
 
                 int startX = drawCol * PIXELS_PER_CELL;
                 int startY = drawRow * PIXELS_PER_CELL;
-                // Array.Fill 比嵌套循环更高效
-                for (int py = 0; py < PIXELS_PER_CELL; py++)
+
+                if (isBubble)
                 {
-                    int offset = (startY + py) * texWidth + startX;
-                    Array.Fill(fillCache, c, offset, PIXELS_PER_CELL);
+                    // 气泡：先填充水色背景，再在中心绘制一个较小的白色圆点
+                    for (int py = 0; py < PIXELS_PER_CELL; py++)
+                    {
+                        int offset = (startY + py) * texWidth + startX;
+                        Array.Fill(fillCache, c, offset, PIXELS_PER_CELL);
+                    }
+                    // 在格子中心绘制一个圆形的白色气泡（半径约为格子的 1/3）
+                    float cx = PIXELS_PER_CELL * 0.5f;
+                    float cy = PIXELS_PER_CELL * 0.5f;
+                    float radius = PIXELS_PER_CELL * 0.35f;
+                    for (int py = 0; py < PIXELS_PER_CELL; py++)
+                    {
+                        for (int px = 0; px < PIXELS_PER_CELL; px++)
+                        {
+                            float dx = px + 0.5f - cx;
+                            float dy = py + 0.5f - cy;
+                            if (dx * dx + dy * dy <= radius * radius)
+                            {
+                                int offset = (startY + py) * texWidth + (startX + px);
+                                fillCache[offset] = bubbleColor;
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    // Array.Fill 比嵌套循环更高效
+                    for (int py = 0; py < PIXELS_PER_CELL; py++)
+                    {
+                        int offset = (startY + py) * texWidth + startX;
+                        Array.Fill(fillCache, c, offset, PIXELS_PER_CELL);
+                    }
                 }
             }
         }

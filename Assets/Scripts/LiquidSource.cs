@@ -10,8 +10,8 @@ public class LiquidSource : MonoBehaviour
     [Tooltip("关联的化学试剂数据（可选，关联后颜色和类型会自动同步）")]
     public ChemicalReagent reagentData;
 
-    [Tooltip("液体类型名称（如：水、酒精、盐酸 等）")]
-    public string liquidType = "水";
+    [Tooltip("液体类型名称（如：Water、Alcohol、HCl 等）")]
+    public string liquidType = "Water";
 
     [Tooltip("液体显示颜色（若关联了 Reagent Data 且 Use Reagent Color 为 true，则优先使用试剂颜色）")]
     public Color liquidColor = new Color(0.2f, 0.5f, 1f, 0.6f);
@@ -22,18 +22,31 @@ public class LiquidSource : MonoBehaviour
     [Tooltip("用于确定液体区域的多边形碰撞器（留空则自动获取自身及子物体的所有 Collider2D）")]
     public Collider2D[] regionColliders;
 
+    /// <summary>
+    /// 碰撞器是否已收集过（避免 ContainsPoint 重复调用 AutoCollectColliders）
+    /// </summary>
+    private bool m_collidersCollected = false;
+
     private void OnValidate()
     {
         AutoCollectColliders();
         SyncFromReagent();
     }
 
+    private void Awake()
+    {
+        AutoCollectColliders();
+    }
+
     private void AutoCollectColliders()
     {
+        if (m_collidersCollected) return;
         if (regionColliders == null || regionColliders.Length == 0)
         {
             regionColliders = GetComponentsInChildren<Collider2D>();
         }
+        if (regionColliders != null && regionColliders.Length > 0)
+            m_collidersCollected = true;
     }
 
     /// <summary>
@@ -43,8 +56,8 @@ public class LiquidSource : MonoBehaviour
     {
         if (reagentData == null) return;
 
-        if (string.IsNullOrEmpty(liquidType) || liquidType == "水")
-            liquidType = reagentData.reagentName;
+        if (string.IsNullOrEmpty(liquidType) || liquidType == "Water")
+            liquidType = !string.IsNullOrEmpty(reagentData.englishName) ? reagentData.englishName : reagentData.reagentName;
 
         if (useReagentColor)
             liquidColor = reagentData.GetDisplayColor();
@@ -65,7 +78,6 @@ public class LiquidSource : MonoBehaviour
     /// </summary>
     public bool ContainsPoint(Vector2 worldPos)
     {
-        AutoCollectColliders();
         if (regionColliders == null) return false;
 
         foreach (var col in regionColliders)
