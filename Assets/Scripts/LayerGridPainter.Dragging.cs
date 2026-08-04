@@ -391,16 +391,15 @@ public partial class LayerGridPainter
                 m_dragStartObjPos.y + delta.y,
                 m_dragStartObjPos.z);
 
-            // 速度限制：平滑移动到目标位置
+            // 整格吸附：直接跳到整格目标位置（一整格一整格拖动，不再平滑滑动）
             Vector3 currentPos = m_draggedObject.transform.position;
-            float maxDelta = dragSpeed * Time.deltaTime;
-            Vector3 smoothedPos = Vector3.MoveTowards(currentPos, targetPos, maxDelta);
+            Vector3 smoothedPos = targetPos;
 
             // 障碍物碰撞检测
             bool shouldCheckCollision = m_combinedCollisionMask != 0 && GetDraggedColliders().Length > 0;
             if (shouldCheckCollision)
             {
-                // 先尝试平滑目标位置
+                // 先尝试整格目标位置
                 m_draggedObject.transform.position = smoothedPos;
                 if (!IsOverlappingWithObstacles())
                 {

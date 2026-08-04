@@ -405,3 +405,6 @@ crashlytics-build.properties
 /[Aa]ssets/[Aa]ddressable[Aa]ssets[Dd]ata/*/*.bin*
 /[Aa]ssets/[Ss]treamingAssets/aa.meta
 /[Aa]ssets/[Ss]treamingAssets/aa/*
+
+# WorkBuddy 本地 AI 数据（记忆/配置），不提交到仓库
+.workbuddy/

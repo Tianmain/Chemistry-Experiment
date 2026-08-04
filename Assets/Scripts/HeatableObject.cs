@@ -8,6 +8,7 @@ using Chemistry;
 ///   - heatDetectCollider：向下检测热源的碰撞体（通常在容器底部）
 /// 液体理化性质优先从 ChemicalReagent 数据库查询，支持液体更换时动态更新。
 /// 升温阶段：检测到下方有火焰时温度上升，无火焰时自然冷却。
+/// 气泡行为：加热过程中气泡数量随温度上升逐渐增多，到达沸点后维持峰值、不再增多。
 /// 到达沸点后：维持温度并按蒸发速率匀速蒸发液体。
 /// 液体蒸发完毕后：温度逐渐回落，停止蒸发。
 /// </summary>
@@ -38,23 +39,24 @@ public class HeatableObject : MonoBehaviour
     [Tooltip("无热源时的冷却速率（°C/秒）")]
     [SerializeField] private float coolingRate = 5f;
 
+    [Tooltip("停止加热后，因余热维持沸腾/气泡的持续时间（秒）。期间温度保持在沸点附近，气泡维持峰值；结束后才开始降温、气泡逐渐减少")]
+    [SerializeField] private float residualHeatDuration = 3f;
+
     [Header("蒸发参数")]
     [Tooltip("默认蒸发速率（格/秒），若数据库标记为易挥发会适当提高")]
     [SerializeField] private float defaultEvaporationRate = 0.5f;
 
     [Header("气泡参数")]
-    [Tooltip("沸腾后经过多少秒气泡数量达到峰值")]
-    [SerializeField] private float bubbleRampUpTime = 8f;
-    [Tooltip("沸腾平稳期每次蒸发额外生成的最大气泡数")]
-    [SerializeField] private int maxExtraBubblesPerTick = 4;
-    [Tooltip("沸腾平稳期每秒额外生成的气泡批次数量")]
-    [SerializeField] private float extraBubbleBatchesPerSecond = 1.5f;
+    [Tooltip("沸腾及加热过程中，单批最多生成的气泡数（会乘以加热进度 0~1）")]
+    [SerializeField] private int maxExtraBubblesPerTick = 6;
+    [Tooltip("加热过程中每秒生成气泡批次的基础数量（会乘以加热进度 0~1）")]
+    [SerializeField] private float extraBubbleBatchesPerSecond = 2.5f;
 
     // 运行时状态
     private float m_currentTemperature;
     private float m_evaporateTimer;
-    private float m_boilingTime;        // 沸腾持续时间（秒）
-    private float m_extraBubbleTimer;   // 额外气泡生成计时器
+    private float m_bubbleTimer;        // 气泡生成计时器
+    private float m_residualTimer;      // 停止加热后的余热计时器（秒），>0 时维持沸腾
     private bool m_isHeated;
     private bool m_wasHeated;
     private LayerGridPainter m_gridPainter;
@@ -79,9 +81,9 @@ public class HeatableObject : MonoBehaviour
     public bool IsHeated => m_isHeated;
 
     /// <summary>
-    /// 是否正在蒸发（温度已达到沸点且有液体）
+    /// 是否正在蒸发（温度已达到沸点、有液体、且处于加热或余热期内）
     /// </summary>
-    public bool IsEvaporating => m_canEvaporate && m_currentTemperature >= m_effectiveBoilingPoint && m_isHeated;
+    public bool IsEvaporating => m_canEvaporate && m_currentTemperature >= m_effectiveBoilingPoint && HasActiveHeat;
 
     /// <summary>
     /// 当前液体的数据库条目
@@ -120,16 +122,19 @@ public class HeatableObject : MonoBehaviour
         // 3. 更新温度
         UpdateTemperature();
 
-        // 4. 蒸发液体（温度达到沸点、有热源、且液体可蒸发时）
-        bool isBoiling = m_canEvaporate && m_currentTemperature >= m_effectiveBoilingPoint && m_isHeated;
+        // 4. 加热进度（0~1）：从室温升到沸点的过程，用于驱动气泡数量“逐渐变多”。
+        //    温度到达沸点后恒为 1，因此气泡数量在沸腾时维持峰值、不再增多。
+        float heatProgress = Mathf.Clamp01(
+            (m_currentTemperature - initialTemperature) /
+            Mathf.Max(0.1f, m_effectiveBoilingPoint - initialTemperature));
+
+        // 5. 沸腾判定：达到沸点、有（有效）热源、且液体可蒸发。
+        //    余热期内仍视为有热源，沸腾与蒸发会继续维持一会儿。
+        bool isBoiling = m_canEvaporate && m_currentTemperature >= m_effectiveBoilingPoint && HasActiveHeat;
+
+        // 6. 蒸发液体：仅在沸腾时按蒸发速率匀速移除液体
         if (isBoiling)
         {
-            // 累积沸腾时间，用于控制气泡强度递增
-            m_boilingTime = Mathf.Min(m_boilingTime + Time.deltaTime, bubbleRampUpTime * 2f);
-
-            // 计算沸腾强度（0~1，随时间逐渐增加到 1）
-            float boilIntensity = Mathf.Clamp01(m_boilingTime / Mathf.Max(0.1f, bubbleRampUpTime));
-
             m_evaporateTimer += Time.deltaTime;
             float interval = 1f / m_effectiveEvaporationRate;
             while (m_evaporateTimer >= interval)
@@ -142,42 +147,35 @@ public class HeatableObject : MonoBehaviour
                     m_evaporateTimer = 0f;
                     break;
                 }
-
-                // 每次蒸发后，根据沸腾强度额外生成气泡
-                int extraBubbles = Mathf.RoundToInt(boilIntensity * maxExtraBubblesPerTick);
-                if (extraBubbles > 0)
-                {
-                    // 有概率额外生成（强度越高概率越大）
-                    if (UnityEngine.Random.value < 0.3f + 0.5f * boilIntensity)
-                    {
-                        m_gridPainter.SpawnBubblesInRegion(liquidSource.regionColliders, extraBubbles);
-                    }
-                }
-            }
-
-            // 额外气泡批次：沸腾越久，周期性批量冒出的气泡越多
-            if (extraBubbleBatchesPerSecond > 0f && boilIntensity > 0.2f)
-            {
-                m_extraBubbleTimer += Time.deltaTime;
-                float batchInterval = 1f / Mathf.Max(0.1f, extraBubbleBatchesPerSecond * boilIntensity);
-                while (m_extraBubbleTimer >= batchInterval)
-                {
-                    m_extraBubbleTimer -= batchInterval;
-                    int batchCount = Mathf.RoundToInt(1 + boilIntensity * maxExtraBubblesPerTick);
-                    m_gridPainter.SpawnBubblesInRegion(liquidSource.regionColliders, batchCount);
-                }
-            }
-            else
-            {
-                m_extraBubbleTimer = 0f;
             }
         }
         else
         {
             m_evaporateTimer = 0f;
-            m_extraBubbleTimer = 0f;
-            // 停止沸腾时，沸腾时间逐渐衰减（不是立即归零，模拟余热）
-            m_boilingTime = Mathf.Max(0f, m_boilingTime - Time.deltaTime * 2f);
+        }
+
+        // 7. 气泡生成：
+        //    气泡数量/频率随温度（heatProgress）变化——加热时逐渐增多，沸腾时维持峰值；
+        //    关火后余热期内仍保持峰值，余热散尽降温时 heatProgress 回落，气泡逐渐减少到无。
+        //    注意：不再强制要求 m_isHeated，这样关火后气泡不会瞬间消失，而是平滑减退。
+        if (heatProgress > 0f)
+        {
+            m_bubbleTimer += Time.deltaTime;
+            // 加热越充分，每秒生成的批次越多（间隔越短）
+            float batchesPerSecond = extraBubbleBatchesPerSecond * heatProgress;
+            float batchInterval = 1f / Mathf.Max(0.01f, batchesPerSecond);
+            while (m_bubbleTimer >= batchInterval)
+            {
+                m_bubbleTimer -= batchInterval;
+                // 每批气泡数随加热进度线性增长，沸腾时达到最大，降温时回到 0
+                int count = Mathf.RoundToInt(heatProgress * maxExtraBubblesPerTick);
+                if (count > 0)
+                    m_gridPainter.SpawnBubblesInRegion(liquidSource.regionColliders, count);
+            }
+        }
+        else
+        {
+            m_bubbleTimer = 0f;
         }
 
         m_wasHeated = m_isHeated;
@@ -278,7 +276,8 @@ public class HeatableObject : MonoBehaviour
     }
 
     /// <summary>
-    /// 根据热源状态更新温度
+    /// 根据热源状态更新温度；停止加热后有一段余热期，期间温度保持在沸点附近，
+    /// 余热散尽才开始自然冷却。
     /// </summary>
     private void UpdateTemperature()
     {
@@ -287,13 +286,25 @@ public class HeatableObject : MonoBehaviour
             // 被加热：温度上升，但不超过沸点 + 一点余量
             float maxTemp = m_effectiveBoilingPoint + 5f;
             m_currentTemperature = Mathf.Min(m_currentTemperature + heatingRate * Time.deltaTime, maxTemp);
+            // 持续加热则把余热计时器保持在满值
+            m_residualTimer = residualHeatDuration;
+        }
+        else if (m_residualTimer > 0f)
+        {
+            // 余热期：温度维持在沸点附近（模拟关火后液体仍沸腾一会儿），不降温
+            m_residualTimer = Mathf.Max(0f, m_residualTimer - Time.deltaTime);
         }
         else
         {
-            // 未加热：温度自然冷却至室温
+            // 余热散尽：温度自然冷却至室温
             float roomTemp = initialTemperature;
             if (m_currentTemperature > roomTemp)
                 m_currentTemperature = Mathf.Max(m_currentTemperature - coolingRate * Time.deltaTime, roomTemp);
         }
     }
+
+    /// <summary>
+    /// 是否处于“有效加热”状态（火焰加热中，或刚关火还在余热期内）
+    /// </summary>
+    private bool HasActiveHeat => m_isHeated || m_residualTimer > 0f;
 }
