@@ -321,7 +321,30 @@ public class LayerGridPainter : MonoBehaviour
                             int steps = Mathf.Max(1, simulationStepsPerTick);
                             for (int i = 0; i < steps; i++)
                                 m_simulator.ProcessWaterSimulation();
+                            // 倒进液体后，把原本 none 的空容器同步成对应液体类型
+                            m_queries.SyncEmptyContainerTypes();
                         }
+                    }
+                }
+                else
+                {
+                    // 普通拖拽：只冻结被拖拽容器内部的液体（WaterSimulator 按 m_draggedCoverage 跳过这些格子），
+                    // 场景其余部分的水/气泡照常模拟——不再整体暂停物理。
+                    m_updateTimer += Time.deltaTime;
+                    if (m_updateTimer >= updateInterval)
+                    {
+                        m_updateTimer = 0f;
+                        if (enableSimulation)
+                        {
+                            int steps = Mathf.Max(1, simulationStepsPerTick);
+                            for (int i = 0; i < steps; i++)
+                                m_simulator.ProcessWaterSimulation();
+                        }
+                        // 注意：普通拖拽期间【不】调用 SyncEmptyContainerTypes。
+                        // 被拖容器里的水被锁在旧网格位置，但其 LiquidSource 的 region 碰撞器已随物体移到新位置，
+                        // RegionHasWater 会误判「区域内无水」，连续若干 tick 后把容器类型错误回退成 "none"（标签变 none）。
+                        // 普通拖拽时本就没有水真正流动/倒入，none↔类型 归类不会发生，无需同步；
+                        // 倾倒（需归类被倒进的液体）与空闲时仍照常同步。
                     }
                 }
                 m_isDirty = true;
@@ -351,6 +374,8 @@ public class LayerGridPainter : MonoBehaviour
                             {
                                 m_simulator.ProcessWaterSimulation();
                             }
+                            // 倒进液体后，把原本 none 的空容器同步成对应液体类型
+                            m_queries.SyncEmptyContainerTypes();
                         }
                     }
                 }

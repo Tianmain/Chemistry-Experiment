@@ -17,6 +17,31 @@ public class WaterSimulator
     }
 
     /// <summary>
+    /// 判断该水格是否处于「被锁定」状态（当前被拖拽容器覆盖）。
+    /// 拖拽期间水模拟跳过这些格子，使杯内液体随容器刚性移动、不参与流动/上浮/混合，
+    /// 而场景其余部分的水照常模拟（满足「只暂停本容器物理、不暂停所有物理」的需求）。
+    /// </summary>
+    private bool IsCellLocked(int col, int row)
+    {
+        var coverage = m_owner.m_draggedCoverage;
+        if (coverage == null) return false;
+        int idx = col + row * m_grid.Columns;
+        return idx >= 0 && idx < coverage.Length && coverage[idx];
+    }
+
+    /// <summary>
+    /// 气泡上浮时的交换目标是否可达：目标格必须是水且未被锁定
+    /// （锁定水属于被拖拽容器，不能被气泡上浮带动，否则会“解冻”杯内液体）。
+    /// </summary>
+    private bool CanBubbleSwapInto(int col, int row)
+    {
+        return col >= 0 && col < m_grid.Columns
+            && row >= 0 && row < m_grid.Rows
+            && m_grid.NextCells[col, row] == CellState.Water
+            && !IsCellLocked(col, row);
+    }
+
+    /// <summary>
     /// 处理水模拟主逻辑
     /// </summary>
     public void ProcessWaterSimulation()
@@ -46,6 +71,7 @@ public class WaterSimulator
                     for (int col = 1; col < m_grid.Columns - 1; col++)
                     {
                         if (m_grid.NextCells[col, row] != CellState.Bubble) continue;
+                    if (IsCellLocked(col, row)) continue; // 杯内气泡锁定：不浮动、不上浮
 
                         bool bubbleMoved = false;
 
@@ -53,7 +79,7 @@ public class WaterSimulator
                         if (row < m_grid.Rows - 2 && !m_grid.IsBoundaryCell(col, row + 1))
                         {
                             CellState above = m_grid.NextCells[col, row + 1];
-                            if (above == CellState.Water)
+                            if (CanBubbleSwapInto(col, row + 1))
                             {
                                 // 气泡上浮：气泡到上方，水到下方
                                 m_grid.NextCells[col, row + 1] = CellState.Bubble;
@@ -80,11 +106,9 @@ public class WaterSimulator
 
                         // 2. 斜上方：左上方或右上方是水
                         bool canLeftUp = row < m_grid.Rows - 2 && col > 1
-                            && m_grid.NextCells[col - 1, row + 1] == CellState.Water
-                            && !m_grid.IsBoundaryCell(col - 1, row + 1);
+                            && CanBubbleSwapInto(col - 1, row + 1);
                         bool canRightUp = row < m_grid.Rows - 2 && col < m_grid.Columns - 2
-                            && m_grid.NextCells[col + 1, row + 1] == CellState.Water
-                            && !m_grid.IsBoundaryCell(col + 1, row + 1);
+                            && CanBubbleSwapInto(col + 1, row + 1);
 
                         if (canLeftUp && canRightUp)
                         {
@@ -118,10 +142,8 @@ public class WaterSimulator
                         else
                         {
                             // 3. 水平方向：左右是水（气泡被上方物体挡住时横向漂移）
-                            bool canLeft = col > 1 && m_grid.NextCells[col - 1, row] == CellState.Water
-                                && !m_grid.IsBoundaryCell(col - 1, row);
-                            bool canRight = col < m_grid.Columns - 2 && m_grid.NextCells[col + 1, row] == CellState.Water
-                                && !m_grid.IsBoundaryCell(col + 1, row);
+                            bool canLeft = col > 1 && CanBubbleSwapInto(col - 1, row);
+                            bool canRight = col < m_grid.Columns - 2 && CanBubbleSwapInto(col + 1, row);
 
                             if (canLeft && canRight)
                             {
@@ -165,6 +187,7 @@ public class WaterSimulator
             for (int col = 0; col < m_grid.Columns; col++)
             {
                 if (m_grid.Cells[col, row] != CellState.Water) continue;
+                if (IsCellLocked(col, row)) continue; // 被拖拽容器内的水：冻结，不流动
                 if (m_grid.Moved[col, row]) continue;
 
                 bool hasMoved = false;
@@ -269,6 +292,7 @@ public class WaterSimulator
             for (int col = 1; col < m_grid.Columns - 2; col++)
             {
                 if (m_grid.NextCells[col, row] != CellState.Water) continue;
+                if (IsCellLocked(col, row)) continue; // 锁定水不参与间隙填充
                 if (m_grid.NextCells[col + 1, row] != CellState.Empty || m_grid.IsBoundaryCell(col + 1, row)) continue;
                 // 目标格下方必须有支撑（否则应该往下掉，不是水平填）
                 if (m_grid.NextCells[col + 1, row - 1] == CellState.Empty && !m_grid.IsBoundaryCell(col + 1, row - 1)) continue;
@@ -287,6 +311,7 @@ public class WaterSimulator
             for (int col = m_grid.Columns - 2; col > 1; col--)
             {
                 if (m_grid.NextCells[col, row] != CellState.Water) continue;
+                if (IsCellLocked(col, row)) continue; // 锁定水不参与间隙填充
                 if (m_grid.NextCells[col - 1, row] != CellState.Empty || m_grid.IsBoundaryCell(col - 1, row)) continue;
                 if (m_grid.NextCells[col - 1, row - 1] == CellState.Empty && !m_grid.IsBoundaryCell(col - 1, row - 1)) continue;
                 // 左侧远处必须有水（这是间隙，不是边缘扩散）
@@ -328,6 +353,7 @@ public class WaterSimulator
             for (int col = 1; col < m_grid.Columns - 1; col++)
             {
                 if (m_grid.NextCells[col, row] != CellState.Water) continue;
+                if (IsCellLocked(col, row)) continue; // 杯内水颜色冻结，不参与混合
 
                 Color srcColor = m_grid.NextLiquidColors[col, row];
                 float rSum = 0f, gSum = 0f, bSum = 0f, aSum = 0f;
@@ -339,6 +365,7 @@ public class WaterSimulator
                     int nr = row + drow[d];
                     if (nc <= 0 || nc >= m_grid.Columns - 1 || nr <= 0 || nr >= m_grid.Rows - 1) continue;
                     if (m_grid.NextCells[nc, nr] != CellState.Water) continue;
+                    if (IsCellLocked(nc, nr)) continue; // 锁定邻居不参与混合，保持其颜色冻结
 
                     Color neighborColor = m_grid.NextLiquidColors[nc, nr];
                     // 颜色差异检测

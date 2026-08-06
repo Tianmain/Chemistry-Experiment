@@ -36,6 +36,15 @@ public class LiquidSource : MonoBehaviour
     /// </summary>
     private bool m_collidersCollected = false;
 
+    /// <summary>
+    /// 运行期防抖计数（不序列化，仅存在于运行时）：
+    ///   - emptyTicks：容器「已持有液体类型、但区域内持续无水」的连续 tick 数，达到阈值才回退为 none；
+    ///   - fillTicks：容器「为空、但区域内持续有水」的连续 tick 数，达到阈值才归类为某液体类型。
+    /// 由 LiquidRegionQueries.SyncEmptyContainerTypes 使用，防止标签在 none / 类型之间抖动（乱变）。
+    /// </summary>
+    [System.NonSerialized] internal int emptyTicks = 0;
+    [System.NonSerialized] internal int fillTicks = 0;
+
     private void OnValidate()
     {
         AutoCollectColliders();

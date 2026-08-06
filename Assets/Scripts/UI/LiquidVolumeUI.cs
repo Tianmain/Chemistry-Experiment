@@ -227,6 +227,13 @@ public class LiquidVolumeUI : MonoBehaviour
         float vol = water * mLPerCell;
         int volRounded = Mathf.FloorToInt(vol / 100f + 0.5f) * 100;
 
+        // 取整后为 0（不足 50 mL 的微量液体）：视为空，标签只显示 "none"
+        if (volRounded <= 0)
+        {
+            m_label.text = LiquidSource.EMPTY_MARKER;
+            return;
+        }
+
         m_textBuilder.Length = 0;
         m_textBuilder.Append(source.liquidType);
         m_textBuilder.Append('\n');
