@@ -28,7 +28,7 @@ public class FlammableObject : MonoBehaviour
 
     private void Start()
     {
-        m_gridPainter = FindObjectOfType<LayerGridPainter>();
+        m_gridPainter = LayerGridPainter.Instance;
     }
 
     private void Update()

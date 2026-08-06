@@ -38,21 +38,14 @@ public class ExtinguishTrigger : MonoBehaviour
             if (centerDist > centerDistanceThreshold)
                 continue;
 
-            // 优先查找 FlammableObject（酒精灯等可燃物体）
-            FlammableObject flammable = other.GetComponent<FlammableObject>();
-            if (flammable == null)
-                flammable = other.GetComponentInParent<FlammableObject>();
+            // 优先查找 FlammableObject（酒精灯等可燃物体），再查找 IgniterController（点火器）
+            HeatComponentFinder.Find(other, out FlammableObject flammable, out IgniterController igniter);
 
             if (flammable != null && flammable.IsIgnited)
             {
                 flammable.Extinguish();
                 continue;
             }
-
-            // 再查找 IgniterController（点火器）
-            IgniterController igniter = other.GetComponent<IgniterController>();
-            if (igniter == null)
-                igniter = other.GetComponentInParent<IgniterController>();
 
             if (igniter != null && igniter.IsIgnited)
                 igniter.Extinguish();

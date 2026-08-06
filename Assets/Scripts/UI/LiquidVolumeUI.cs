@@ -55,6 +55,9 @@ public class LiquidVolumeUI : MonoBehaviour
     // 共享白色贴图（所有标签共用一张，避免重复分配）
     private static Texture2D s_whiteTex;
     private static Sprite s_whiteSprite;
+
+    // 复用的角点缓冲：避免 GetLocalContainerBounds 每次调用都 new 一个数组（每刷新一次就分配一次）
+    private static readonly Vector3[] s_cornerBuffer = new Vector3[4];
     private static Sprite WhiteSprite
     {
         get
@@ -81,7 +84,7 @@ public class LiquidVolumeUI : MonoBehaviour
     private void ResolveReferences()
     {
         if (painter == null)
-            painter = FindObjectOfType<LayerGridPainter>();
+            painter = LayerGridPainter.Instance;
         if (source == null)
             source = GetComponentInParent<LiquidSource>();
     }
@@ -212,14 +215,11 @@ public class LiquidVolumeUI : MonoBehaviour
                 Bounds wb = c.bounds;
                 // 取世界 AABB 的 4 个角点，逆变换回局部空间
                 Vector3 min = wb.min, max = wb.max;
-                Vector3[] corners = new Vector3[]
-                {
-                    new Vector3(min.x, min.y, min.z),
-                    new Vector3(max.x, min.y, min.z),
-                    new Vector3(min.x, max.y, min.z),
-                    new Vector3(max.x, max.y, min.z),
-                };
-                foreach (var corner in corners)
+                s_cornerBuffer[0].Set(min.x, min.y, min.z);
+                s_cornerBuffer[1].Set(max.x, min.y, min.z);
+                s_cornerBuffer[2].Set(min.x, max.y, min.z);
+                s_cornerBuffer[3].Set(max.x, max.y, min.z);
+                foreach (var corner in s_cornerBuffer)
                 {
                     Vector3 localPt = transform.InverseTransformPoint(corner);
                     if (!has) { b = new Bounds(localPt, Vector3.zero); has = true; }

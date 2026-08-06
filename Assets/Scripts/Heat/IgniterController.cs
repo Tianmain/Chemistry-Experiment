@@ -76,9 +76,7 @@ public class IgniterController : MonoBehaviour
             if (other.transform.IsChildOf(transform)) continue;
 
             // 优先在碰撞体所在物体上查找 FlammableObject，否则向上查找
-            FlammableObject flammable = other.GetComponent<FlammableObject>();
-            if (flammable == null)
-                flammable = other.GetComponentInParent<FlammableObject>();
+            HeatComponentFinder.Find(other, out FlammableObject flammable, out _);
 
             if (flammable != null && !flammable.IsIgnited)
                 flammable.Ignite();

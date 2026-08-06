@@ -92,7 +92,7 @@ public class HeatableObject : MonoBehaviour
 
     private void Start()
     {
-        m_gridPainter = FindObjectOfType<LayerGridPainter>();
+        m_gridPainter = LayerGridPainter.Instance;
         m_currentTemperature = initialTemperature;
         m_evaporateTimer = 0f;
 
@@ -117,7 +117,8 @@ public class HeatableObject : MonoBehaviour
         }
 
         // 2. 检测下方是否有火焰热源
-        m_isHeated = DetectHeatSource();
+        //    空容器（无液体）无需检测热源，省去每帧的 OverlapCollider + GetComponent 开销
+        m_isHeated = liquidSource.IsEmpty() ? false : DetectHeatSource();
 
         // 3. 更新温度
         UpdateTemperature();
@@ -257,16 +258,10 @@ public class HeatableObject : MonoBehaviour
             Collider2D other = m_heatDetectBuffer[i];
             if (other == null || other.transform.IsChildOf(transform)) continue;
 
-            // 检测 FlammableObject（如酒精灯）
-            FlammableObject flammable = other.GetComponent<FlammableObject>();
-            if (flammable == null) flammable = other.GetComponentInParent<FlammableObject>();
+            HeatComponentFinder.Find(other, out FlammableObject flammable, out IgniterController igniter);
 
             if (flammable != null && flammable.IsIgnited)
                 return true;
-
-            // 检测 IgniterController（点火器）
-            IgniterController igniter = other.GetComponent<IgniterController>();
-            if (igniter == null) igniter = other.GetComponentInParent<IgniterController>();
 
             if (igniter != null && igniter.IsIgnited)
                 return true;

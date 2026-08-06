@@ -1,9 +1,69 @@
-using System;
 using UnityEngine;
 using System.Collections.Generic;
 
-public partial class LayerGridPainter
+/// <summary>
+/// 拖拽 / 旋转控制子系统：处理左键拖拽物体、倾倒、右键 90° 旋转杯体并让内部液体随杯刚性旋转。
+/// 自身持有大部分拖拽/旋转状态字段；与渲染共享的少数状态（m_isDragging / m_draggedObject /
+/// m_dragOffsetX/Y / m_draggedCoverage）保留在协调器上（internal），渲染器据此做视觉偏移。
+/// 直接读写 LiquidGrid 提交拖拽/旋转结果。
+/// </summary>
+public class DragController
 {
+    private readonly LayerGridPainter m_owner;
+    private readonly LiquidGrid m_grid;
+
+    // 以下为拖拽/旋转自身状态（渲染器不读取，故内聚于此）
+    private bool m_isPouring = false;       // 是否处于倾倒中（已松开粘合，交给水模拟）
+    private bool m_pourStarted = false;     // 本次拖拽是否已经触发过一次倾倒
+
+    private Vector3 m_dragStartMousePos;
+    private Vector3 m_dragStartObjPos;
+    private Quaternion m_dragStartObjRot;
+    private Collider2D m_draggedCollider;
+    private Vector3 m_lastValidDragPos;
+    private Bounds m_draggedObjOriginalBounds;
+
+    private bool m_isRotating = false;      // 是否正在右键拖拽旋转
+    private GameObject m_rotTarget;        // 右键旋转目标（即左键拖拽的物体）
+    private Quaternion m_rotStartObjRot;    // 右键旋转开始时的物体姿态（旋转基准）
+    private float m_rotStartAngle = 0f;     // 右键按下时鼠标相对物体中心的角度（度）
+
+    private GameObject m_lastDraggedObject;  // 最近一次被左键拖拽的物体（右键旋转结束即清空）
+
+    // 右键旋转期间：把烧杯内容物（水+杯壁障碍）随杯体一起刚性旋转所需的快照与状态
+    private List<int> m_rotSnapCol = new List<int>();
+    private List<int> m_rotSnapRow = new List<int>();
+    private List<CellState> m_rotSnapState = new List<CellState>();
+    private List<Color> m_rotSnapColor = new List<Color>();
+    private List<Vector2Int> m_rotLastWritten = new List<Vector2Int>();
+    private float m_rotCenterColF = 0f;
+    private float m_rotCenterRowF = 0f;
+
+    private Rigidbody2D m_draggedRigidbody;
+    private bool m_wasKinematic = false;
+    private int m_combinedCollisionMask;
+
+    private Collider2D[] m_draggedObjColliders; // 被拖拽物体的碰撞器缓存（用于精确偏移格子）
+
+    private struct RigidbodyState
+    {
+        public Rigidbody2D rb;
+        public bool wasKinematic;
+    }
+    private List<RigidbodyState> m_otherRigidbodyStates = new List<RigidbodyState>();
+
+    public DragController(LayerGridPainter owner)
+    {
+        m_owner = owner;
+        m_grid = owner.gridData;
+    }
+
+    /// <summary>当前是否正在右键旋转（旋转期间暂停水模拟）</summary>
+    public bool IsRotating => m_isRotating;
+
+    /// <summary>当前是否处于倾倒中（已松开粘合，由水模拟接管流出）</summary>
+    public bool IsPouring => m_isPouring;
+
     /// <summary>
     /// 判断碰撞物体的 Tag 是否应该被忽略（可穿透）
     /// 优先级：绝对不可穿透 > 互阻规则 > 拖拽物体本身可穿透 > 障碍物可穿透
@@ -13,18 +73,18 @@ public partial class LayerGridPainter
         if (string.IsNullOrEmpty(obstacleTag)) return false;
 
         // 1. 绝对不可穿透：任何物体都不能穿过的障碍物
-        if (m_impassableTagSet != null && m_impassableTagSet.Contains(obstacleTag))
+        if (m_owner.m_impassableTagSet != null && m_owner.m_impassableTagSet.Contains(obstacleTag))
             return false;
 
         // 2. 互阻规则：两个 Tag 之间互相阻碍
-        if (m_draggedObject != null && mutualBlockRules != null)
+        if (m_owner.m_draggedObject != null && m_owner.mutualBlockRules != null)
         {
-            string draggedTag = m_draggedObject.tag;
-            for (int i = 0; i < mutualBlockRules.Length; i++)
+            string draggedTag = m_owner.m_draggedObject.tag;
+            for (int i = 0; i < m_owner.mutualBlockRules.Length; i++)
             {
-                if (mutualBlockRules[i] == null) continue;
-                if ((mutualBlockRules[i].tagA == draggedTag && mutualBlockRules[i].tagB == obstacleTag)
-                 || (mutualBlockRules[i].tagA == obstacleTag && mutualBlockRules[i].tagB == draggedTag))
+                if (m_owner.mutualBlockRules[i] == null) continue;
+                if ((m_owner.mutualBlockRules[i].tagA == draggedTag && m_owner.mutualBlockRules[i].tagB == obstacleTag)
+                 || (m_owner.mutualBlockRules[i].tagA == obstacleTag && m_owner.mutualBlockRules[i].tagB == draggedTag))
                 {
                     return false; // 这两个 Tag 之间互相阻碍
                 }
@@ -32,11 +92,11 @@ public partial class LayerGridPainter
         }
 
         // 4. 如果被拖拽的物体本身是可穿透的，那么它也可以穿过其他非绝对不可穿透的物体
-        if (m_draggedObject != null && m_penetrableTagSet != null && m_penetrableTagSet.Contains(m_draggedObject.tag))
+        if (m_owner.m_draggedObject != null && m_owner.m_penetrableTagSet != null && m_owner.m_penetrableTagSet.Contains(m_owner.m_draggedObject.tag))
             return true;
 
         // 5. 障碍物是可穿透的：别人穿过它时允许
-        if (m_penetrableTagSet != null && m_penetrableTagSet.Contains(obstacleTag))
+        if (m_owner.m_penetrableTagSet != null && m_owner.m_penetrableTagSet.Contains(obstacleTag))
             return true;
 
         return false;
@@ -48,16 +108,16 @@ public partial class LayerGridPainter
     /// </summary>
     private float GetCollisionTolerance(string obstacleTag)
     {
-        if (m_draggedObject != null && mutualBlockRules != null)
+        if (m_owner.m_draggedObject != null && m_owner.mutualBlockRules != null)
         {
-            string draggedTag = m_draggedObject.tag;
-            for (int i = 0; i < mutualBlockRules.Length; i++)
+            string draggedTag = m_owner.m_draggedObject.tag;
+            for (int i = 0; i < m_owner.mutualBlockRules.Length; i++)
             {
-                if (mutualBlockRules[i] == null) continue;
-                if ((mutualBlockRules[i].tagA == draggedTag && mutualBlockRules[i].tagB == obstacleTag)
-                 || (mutualBlockRules[i].tagA == obstacleTag && mutualBlockRules[i].tagB == draggedTag))
+                if (m_owner.mutualBlockRules[i] == null) continue;
+                if ((m_owner.mutualBlockRules[i].tagA == draggedTag && m_owner.mutualBlockRules[i].tagB == obstacleTag)
+                 || (m_owner.mutualBlockRules[i].tagA == obstacleTag && m_owner.mutualBlockRules[i].tagB == draggedTag))
                 {
-                    return mutualBlockRules[i].collisionTolerance;
+                    return m_owner.mutualBlockRules[i].collisionTolerance;
                 }
             }
         }
@@ -69,8 +129,8 @@ public partial class LayerGridPainter
     /// </summary>
     private Collider2D[] GetDraggedColliders()
     {
-        if (m_draggedObject == null) return System.Array.Empty<Collider2D>();
-        Collider2D[] all = m_draggedObject.GetComponentsInChildren<Collider2D>();
+        if (m_owner.m_draggedObject == null) return System.Array.Empty<Collider2D>();
+        Collider2D[] all = m_owner.m_draggedObject.GetComponentsInChildren<Collider2D>();
         int count = 0;
         for (int i = 0; i < all.Length; i++)
             if (all[i] != null && !all[i].isTrigger) count++;
@@ -97,23 +157,23 @@ public partial class LayerGridPainter
     /// 碰撞器直接覆盖的格子（容器壁）始终缓存；
     /// 容器内的水通过 LiquidSource 的区域碰撞器检测，使液体跟随拖拽同步移动。
     /// </summary>
-    public void CacheDraggedCoverage()
+    private void CacheDraggedCoverage()
     {
-        if (m_draggedObjColliders == null || m_columns <= 0 || m_rows <= 0) return;
+        if (m_draggedObjColliders == null || m_grid.Columns <= 0 || m_grid.Rows <= 0) return;
 
-        m_draggedCoverage = new bool[m_columns * m_rows];
+        m_owner.m_draggedCoverage = new bool[m_grid.Columns * m_grid.Rows];
 
         // 1. 缓存碰撞器直接覆盖的格子（容器壁）
-        for (int row = 0; row < m_rows; row++)
+        for (int row = 0; row < m_grid.Rows; row++)
         {
-            for (int col = 0; col < m_columns; col++)
+            for (int col = 0; col < m_grid.Columns; col++)
             {
-                Vector2 cellCenter = GetWorldPosition(col, row);
+                Vector2 cellCenter = m_grid.GetWorldPosition(col, row);
                 foreach (var draggedCol in m_draggedObjColliders)
                 {
                     if (draggedCol != null && !draggedCol.isTrigger && draggedCol.OverlapPoint(cellCenter))
                     {
-                        m_draggedCoverage[col + row * m_columns] = true;
+                        m_owner.m_draggedCoverage[col + row * m_grid.Columns] = true;
                         break;
                     }
                 }
@@ -121,23 +181,23 @@ public partial class LayerGridPainter
         }
 
         // 2. 查找物体及其子物体中的所有 LiquidSource
-        if (m_draggedObject == null) return;
-        LiquidSource[] liquidSources = m_draggedObject.GetComponentsInChildren<LiquidSource>();
+        if (m_owner.m_draggedObject == null) return;
+        LiquidSource[] liquidSources = m_owner.m_draggedObject.GetComponentsInChildren<LiquidSource>();
         if (liquidSources == null || liquidSources.Length == 0) return;
 
         // 3. 通过 LiquidSource 的区域碰撞器检测容器内的水格子
         //    同时：如果 Water 格子正下方是被拖拽物体覆盖的格子（杯底），也标记为跟随
         //    （防止最底层水因 LiquidSource 碰撞器边界漏检而留在原地）
-        for (int row = 1; row < m_rows - 1; row++)
+        for (int row = 1; row < m_grid.Rows - 1; row++)
         {
-            for (int col = 1; col < m_columns - 1; col++)
+            for (int col = 1; col < m_grid.Columns - 1; col++)
             {
                 // 水和气泡都需要跟随容器拖拽
-                if (m_grid[col, row] != CellState.Water && m_grid[col, row] != CellState.Bubble) continue;
-                int idx = col + row * m_columns;
-                if (m_draggedCoverage[idx]) continue;
+                if (m_grid.Cells[col, row] != CellState.Water && m_grid.Cells[col, row] != CellState.Bubble) continue;
+                int idx = col + row * m_grid.Columns;
+                if (m_owner.m_draggedCoverage[idx]) continue;
 
-                Vector2 cellCenter = GetWorldPosition(col, row);
+                Vector2 cellCenter = m_grid.GetWorldPosition(col, row);
                 bool shouldMark = false;
 
                 // LiquidSource 区域检测
@@ -153,13 +213,13 @@ public partial class LayerGridPainter
                 // 正下方是被拖拽物体覆盖的格子（杯底）
                 if (!shouldMark && row > 0)
                 {
-                    int belowIdx = col + (row - 1) * m_columns;
-                    if (m_draggedCoverage[belowIdx])
+                    int belowIdx = col + (row - 1) * m_grid.Columns;
+                    if (m_owner.m_draggedCoverage[belowIdx])
                         shouldMark = true;
                 }
 
                 if (shouldMark)
-                    m_draggedCoverage[idx] = true;
+                    m_owner.m_draggedCoverage[idx] = true;
             }
         }
     }
@@ -177,25 +237,25 @@ public partial class LayerGridPainter
         foreach (var col in colliders)
         {
             if (col == null || col.isTrigger) continue;
-            m_contactFilter.SetLayerMask(m_combinedCollisionMask);
-            int count = Physics2D.OverlapCollider(col, m_contactFilter, m_colliderBuffer);
+            m_owner.m_contactFilter.SetLayerMask(m_combinedCollisionMask);
+            int count = Physics2D.OverlapCollider(col, m_owner.m_contactFilter, m_owner.m_colliderBuffer);
             for (int i = 0; i < count; i++)
             {
-                if (m_colliderBuffer[i] != null && m_colliderBuffer[i].gameObject != m_draggedObject)
+                if (m_owner.m_colliderBuffer[i] != null && m_owner.m_colliderBuffer[i].gameObject != m_owner.m_draggedObject)
                 {
-                    if (m_colliderBuffer[i].isTrigger)
+                    if (m_owner.m_colliderBuffer[i].isTrigger)
                         continue;
-                    if (ShouldIgnoreCollision(m_colliderBuffer[i].tag))
+                    if (ShouldIgnoreCollision(m_owner.m_colliderBuffer[i].tag))
                         continue;
 
-                    bool isRelated = m_colliderBuffer[i].transform.IsChildOf(m_draggedObject.transform)
-                                  || m_draggedObject.transform.IsChildOf(m_colliderBuffer[i].transform)
-                                  || HasSameParent(m_draggedObject.transform, m_colliderBuffer[i].transform);
-                    float baseThreshold = isRelated ? -parentChildCollisionTolerance : -0.001f;
-                    float tolerance = GetCollisionTolerance(m_colliderBuffer[i].tag);
+                    bool isRelated = m_owner.m_colliderBuffer[i].transform.IsChildOf(m_owner.m_draggedObject.transform)
+                                  || m_owner.m_draggedObject.transform.IsChildOf(m_owner.m_colliderBuffer[i].transform)
+                                  || HasSameParent(m_owner.m_draggedObject.transform, m_owner.m_colliderBuffer[i].transform);
+                    float baseThreshold = isRelated ? -m_owner.parentChildCollisionTolerance : -0.001f;
+                    float tolerance = GetCollisionTolerance(m_owner.m_colliderBuffer[i].tag);
                     float threshold = baseThreshold - tolerance;
 
-                    var dist = Physics2D.Distance(col, m_colliderBuffer[i]);
+                    var dist = Physics2D.Distance(col, m_owner.m_colliderBuffer[i]);
                     if (dist.isValid && dist.distance < threshold)
                     {
                         return true;
@@ -206,25 +266,13 @@ public partial class LayerGridPainter
         return false;
     }
 
-    private Rigidbody2D m_draggedRigidbody;
-    private bool m_wasKinematic = false;
-
-    private int m_combinedCollisionMask;
-
-    private struct RigidbodyState
-    {
-        public Rigidbody2D rb;
-        public bool wasKinematic;
-    }
-    private List<RigidbodyState> m_otherRigidbodyStates = new List<RigidbodyState>();
-
     /// <summary>
     /// 获取所有可拖拽物体所在的 Layer 掩码
     /// </summary>
     private int GetDraggableLayerMask()
     {
         int mask = 0;
-        foreach (string tag in draggableTags)
+        foreach (string tag in m_owner.draggableTags)
         {
             GameObject[] objs = null;
             try
@@ -250,7 +298,7 @@ public partial class LayerGridPainter
     private void FreezeOtherDraggableObjects()
     {
         m_otherRigidbodyStates.Clear();
-        foreach (string tag in draggableTags)
+        foreach (string tag in m_owner.draggableTags)
         {
             GameObject[] objs = null;
             try
@@ -263,7 +311,7 @@ public partial class LayerGridPainter
             }
             foreach (GameObject obj in objs)
             {
-                if (obj == null || obj == m_draggedObject) continue;
+                if (obj == null || obj == m_owner.m_draggedObject) continue;
                 Rigidbody2D rb = obj.GetComponent<Rigidbody2D>();
                 if (rb != null)
                 {
@@ -289,9 +337,12 @@ public partial class LayerGridPainter
         m_otherRigidbodyStates.Clear();
     }
 
-    private void HandleDrag()
+    /// <summary>
+    /// 每帧处理拖拽输入（由协调器 Update 调用）
+    /// </summary>
+    public void HandleDrag()
     {
-        Camera cam = GetCachedCamera();
+        Camera cam = m_owner.GetCachedCamera();
         if (cam == null) return;
 
         if (Input.GetMouseButtonDown(0))
@@ -302,7 +353,7 @@ public partial class LayerGridPainter
             Collider2D targetHit = null;
             foreach (var h in hits)
             {
-                if (h != null && !h.isTrigger && m_draggableTagSet.Contains(h.tag))
+                if (h != null && !h.isTrigger && m_owner.m_draggableTagSet.Contains(h.tag))
                 {
                     targetHit = h;
                     break;
@@ -320,9 +371,9 @@ public partial class LayerGridPainter
                 while (draggedRoot.transform.parent != null)
                 {
                     GameObject parent = draggedRoot.transform.parent.gameObject;
-                    if (m_draggableTagSet.Contains(parent.tag))
+                    if (m_owner.m_draggableTagSet.Contains(parent.tag))
                     {
-                        if (m_draggableTagSet.Contains(draggedRoot.tag) && draggedRoot.tag != parent.tag)
+                        if (m_owner.m_draggableTagSet.Contains(draggedRoot.tag) && draggedRoot.tag != parent.tag)
                         {
                             break;
                         }
@@ -334,14 +385,14 @@ public partial class LayerGridPainter
                     }
                 }
 
-                m_isDragging = true;
-                m_draggedObject = draggedRoot;
+                m_owner.m_isDragging = true;
+                m_owner.m_draggedObject = draggedRoot;
                 m_lastDraggedObject = draggedRoot; // 跨拖拽保留，供松手后右键旋转使用
                 m_pourStarted = false;
                 m_isPouring = false;
                 m_dragStartMousePos = mousePos;
-                m_dragStartObjPos = m_draggedObject.transform.position;
-                m_dragStartObjRot = m_draggedObject.transform.rotation;
+                m_dragStartObjPos = m_owner.m_draggedObject.transform.position;
+                m_dragStartObjRot = m_owner.m_draggedObject.transform.rotation;
                 m_draggedCollider = targetHit;
                 m_lastValidDragPos = m_dragStartObjPos;
 
@@ -367,10 +418,10 @@ public partial class LayerGridPainter
                 CacheDraggedCoverage();
 
                 // 构建碰撞检测用的组合 LayerMask（障碍物 + 其他可拖拽物体）
-                m_combinedCollisionMask = m_obstacleLayerMask | GetDraggableLayerMask();
+                m_combinedCollisionMask = m_owner.m_obstacleLayerMask | GetDraggableLayerMask();
 
                 // 拖拽期间将被拖拽物体的 Rigidbody2D 设为 Kinematic，防止物理引擎干扰
-                m_draggedRigidbody = m_draggedObject.GetComponent<Rigidbody2D>();
+                m_draggedRigidbody = m_owner.m_draggedObject.GetComponent<Rigidbody2D>();
                 if (m_draggedRigidbody != null)
                 {
                     m_wasKinematic = m_draggedRigidbody.isKinematic;
@@ -381,13 +432,13 @@ public partial class LayerGridPainter
                 FreezeOtherDraggableObjects();
             }
         }
-        else if (Input.GetMouseButton(0) && m_isDragging)
+        else if (Input.GetMouseButton(0) && m_owner.m_isDragging)
         {
             Vector2 currentMousePos = cam.ScreenToWorldPoint(Input.mousePosition);
             Vector3 delta = currentMousePos - (Vector2)m_dragStartMousePos;
             // 吸附到整格
-            delta.x = Mathf.Round(delta.x / cellSize) * cellSize;
-            delta.y = Mathf.Round(delta.y / cellSize) * cellSize;
+            delta.x = Mathf.Round(delta.x / m_grid.CellSize) * m_grid.CellSize;
+            delta.y = Mathf.Round(delta.y / m_grid.CellSize) * m_grid.CellSize;
             delta.z = 0;
 
             Vector3 targetPos = new Vector3(
@@ -396,7 +447,7 @@ public partial class LayerGridPainter
                 m_dragStartObjPos.z);
 
             // 整格吸附：直接跳到整格目标位置（一整格一整格拖动，不再平滑滑动）
-            Vector3 currentPos = m_draggedObject.transform.position;
+            Vector3 currentPos = m_owner.m_draggedObject.transform.position;
             Vector3 smoothedPos = targetPos;
 
             // 障碍物碰撞检测（复用缓存碰撞器，避免每帧分配）
@@ -404,7 +455,7 @@ public partial class LayerGridPainter
             if (shouldCheckCollision)
             {
                 // 先尝试整格目标位置
-                m_draggedObject.transform.position = smoothedPos;
+                m_owner.m_draggedObject.transform.position = smoothedPos;
                 if (!IsOverlappingWithObstacles())
                 {
                     m_lastValidDragPos = smoothedPos;
@@ -420,29 +471,29 @@ public partial class LayerGridPainter
                     foreach (var draggedCol in draggedCols)
                     {
                         if (draggedCol == null || draggedCol.isTrigger) continue;
-                        m_contactFilter.SetLayerMask(m_combinedCollisionMask);
-                        int count = Physics2D.OverlapCollider(draggedCol, m_contactFilter, m_colliderBuffer);
+                        m_owner.m_contactFilter.SetLayerMask(m_combinedCollisionMask);
+                        int count = Physics2D.OverlapCollider(draggedCol, m_owner.m_contactFilter, m_owner.m_colliderBuffer);
                         for (int i = 0; i < count; i++)
                         {
-                            if (m_colliderBuffer[i] != null && m_colliderBuffer[i].gameObject != m_draggedObject)
+                            if (m_owner.m_colliderBuffer[i] != null && m_owner.m_colliderBuffer[i].gameObject != m_owner.m_draggedObject)
                             {
-                                if (m_colliderBuffer[i].isTrigger)
+                                if (m_owner.m_colliderBuffer[i].isTrigger)
                                     continue;
-                                if (ShouldIgnoreCollision(m_colliderBuffer[i].tag))
+                                if (ShouldIgnoreCollision(m_owner.m_colliderBuffer[i].tag))
                                     continue;
 
-                                bool isRelated = m_colliderBuffer[i].transform.IsChildOf(m_draggedObject.transform)
-                                              || m_draggedObject.transform.IsChildOf(m_colliderBuffer[i].transform)
-                                              || HasSameParent(m_draggedObject.transform, m_colliderBuffer[i].transform);
-                                float baseThreshold = isRelated ? -parentChildCollisionTolerance : -0.001f;
-                                float tol = GetCollisionTolerance(m_colliderBuffer[i].tag);
+                                bool isRelated = m_owner.m_colliderBuffer[i].transform.IsChildOf(m_owner.m_draggedObject.transform)
+                                              || m_owner.m_draggedObject.transform.IsChildOf(m_owner.m_colliderBuffer[i].transform)
+                                              || HasSameParent(m_owner.m_draggedObject.transform, m_owner.m_colliderBuffer[i].transform);
+                                float baseThreshold = isRelated ? -m_owner.parentChildCollisionTolerance : -0.001f;
+                                float tol = GetCollisionTolerance(m_owner.m_colliderBuffer[i].tag);
                                 float threshold = baseThreshold - tol;
 
-                                var dist = Physics2D.Distance(draggedCol, m_colliderBuffer[i]);
+                                var dist = Physics2D.Distance(draggedCol, m_owner.m_colliderBuffer[i]);
                                 if (dist.isValid && dist.distance < threshold)
                                 {
                                     // 使用障碍物中心到物体中心的方向，不受穿透深度影响
-                                    Vector2 obstacleCenter = m_colliderBuffer[i].bounds.center;
+                                    Vector2 obstacleCenter = m_owner.m_colliderBuffer[i].bounds.center;
                                     Vector2 objectCenter = draggedCol.bounds.center;
                                     Vector2 dirFromObstacle = (objectCenter - obstacleCenter).normalized;
                                     if (dirFromObstacle.magnitude < 0.1f)
@@ -471,7 +522,7 @@ public partial class LayerGridPainter
                     // 如果法线判断没有给出任何阻挡方向（切向或远离），直接允许移动
                     if (blockedNormal.magnitude < 0.01f)
                     {
-                        m_draggedObject.transform.position = allowedPos;
+                        m_owner.m_draggedObject.transform.position = allowedPos;
                     }
                     else
                     {
@@ -479,49 +530,49 @@ public partial class LayerGridPainter
                         if (!blockX)
                         {
                             Vector3 testX = new Vector3(smoothedPos.x, currentPos.y, currentPos.z);
-                            m_draggedObject.transform.position = testX;
+                            m_owner.m_draggedObject.transform.position = testX;
                             if (IsOverlappingWithObstacles()) allowedPos.x = currentPos.x;
                         }
                         if (!blockY)
                         {
                             Vector3 testY = new Vector3(allowedPos.x, smoothedPos.y, allowedPos.z);
-                            m_draggedObject.transform.position = testY;
+                            m_owner.m_draggedObject.transform.position = testY;
                             if (IsOverlappingWithObstacles()) allowedPos.y = currentPos.y;
                         }
-                        m_draggedObject.transform.position = allowedPos;
+                        m_owner.m_draggedObject.transform.position = allowedPos;
                     }
                     m_lastValidDragPos = allowedPos;
                 }
 
                 // 用实际有效偏移量更新（而非原始鼠标偏移）
-                m_dragOffsetX = m_lastValidDragPos.x - m_dragStartObjPos.x;
-                m_dragOffsetY = m_lastValidDragPos.y - m_dragStartObjPos.y;
+                m_owner.m_dragOffsetX = m_lastValidDragPos.x - m_dragStartObjPos.x;
+                m_owner.m_dragOffsetY = m_lastValidDragPos.y - m_dragStartObjPos.y;
             }
             else
             {
-                m_draggedObject.transform.position = smoothedPos;
+                m_owner.m_draggedObject.transform.position = smoothedPos;
                 m_lastValidDragPos = smoothedPos;
 
-                m_dragOffsetX = m_lastValidDragPos.x - m_dragStartObjPos.x;
-                m_dragOffsetY = m_lastValidDragPos.y - m_dragStartObjPos.y;
+                m_owner.m_dragOffsetX = m_lastValidDragPos.x - m_dragStartObjPos.x;
+                m_owner.m_dragOffsetY = m_lastValidDragPos.y - m_dragStartObjPos.y;
             }
 
             // 倾倒由右键拖拽旋转触发（见 HandleRotateInput），不再使用滚轮
 
-            m_isDirty = true;
+            m_owner.m_isDirty = true;
         }
         else if (Input.GetMouseButtonUp(0))
         {
             bool hadPour = m_pourStarted;
-            if (m_isDragging && m_draggedObject != null)
+            if (m_owner.m_isDragging && m_owner.m_draggedObject != null)
             {
                 ApplyDragOffsetToGrid();
             }
-            m_dragOffsetX = 0;
-            m_dragOffsetY = 0;
+            m_owner.m_dragOffsetX = 0;
+            m_owner.m_dragOffsetY = 0;
             // 未发生真实倾倒时把杯体转回直立，避免空杯一直歪着
-            if (!hadPour && m_draggedObject != null)
-                m_draggedObject.transform.rotation = m_dragStartObjRot;
+            if (!hadPour && m_owner.m_draggedObject != null)
+                m_owner.m_draggedObject.transform.rotation = m_dragStartObjRot;
             m_isPouring = false;
             m_pourStarted = false;
             // 恢复 Rigidbody2D 的原始状态
@@ -535,14 +586,13 @@ public partial class LayerGridPainter
             RestoreOtherDraggableObjects();
             m_combinedCollisionMask = 0;
             m_draggedObjColliders = null;
-            m_draggedCoverage = null;
+            m_owner.m_draggedCoverage = null;
 
-            m_isDragging = false;
-            m_draggedObject = null;
+            m_owner.m_isDragging = false;
+            m_owner.m_draggedObject = null;
             // 拖拽结束：强制下一帧重扫障碍物，确保物体最终落点的杯壁障碍准确无误
-            m_sceneDirty = true;
-            if (fillObj != null)
-                fillObj.transform.localPosition = Vector3.zero;
+            m_owner.m_sceneDirty = true;
+            m_owner.ResetFillObject();
         }
 
         // 右键拖拽旋转：作用于左键拖拽的物体，量化到 90° 倍数（左键仍按住时也能旋转）
@@ -556,71 +606,59 @@ public partial class LayerGridPainter
     /// </summary>
     private void ApplyDragOffsetToGrid()
     {
-        if (m_dragOffsetX == 0 && m_dragOffsetY == 0) return;
+        if (m_owner.m_dragOffsetX == 0 && m_owner.m_dragOffsetY == 0) return;
 
-        int offsetCol = Mathf.RoundToInt(m_dragOffsetX / cellSize);
-        int offsetRow = Mathf.RoundToInt(m_dragOffsetY / cellSize);
+        int offsetCol = Mathf.RoundToInt(m_owner.m_dragOffsetX / m_grid.CellSize);
+        int offsetRow = Mathf.RoundToInt(m_owner.m_dragOffsetY / m_grid.CellSize);
 
         if (offsetCol == 0 && offsetRow == 0) return;
 
         // 复制 m_grid → m_nextGrid（Array.Copy 比嵌套循环更快）
-        Array.Copy(m_grid, m_nextGrid, m_grid.Length);
-
-        // 复制颜色网格
-        if (m_liquidColorGrid != null && m_nextLiquidColorGrid != null)
-        {
-            System.Array.Copy(m_liquidColorGrid, m_nextLiquidColorGrid, m_liquidColorGrid.Length);
-        }
+        m_grid.CopyCurrentToNext();
 
         // 逆运动方向遍历：靠近目标的格子先移，腾出位置给后面的格子
         // 这样连续的水/障碍块可以整体平移，不会因前面的格子挡住而丢失
-        int colStart = offsetCol > 0 ? m_columns - 1 : 0;
-        int colEnd   = offsetCol > 0 ? -1 : m_columns;
+        int colStart = offsetCol > 0 ? m_grid.Columns - 1 : 0;
+        int colEnd   = offsetCol > 0 ? -1 : m_grid.Columns;
         int colStep  = offsetCol > 0 ? -1 : 1;
 
-        int rowStart = offsetRow > 0 ? m_rows - 1 : 0;
-        int rowEnd   = offsetRow > 0 ? -1 : m_rows;
+        int rowStart = offsetRow > 0 ? m_grid.Rows - 1 : 0;
+        int rowEnd   = offsetRow > 0 ? -1 : m_grid.Rows;
         int rowStep  = offsetRow > 0 ? -1 : 1;
 
         for (int col = colStart; col != colEnd; col += colStep)
         {
             for (int row = rowStart; row != rowEnd; row += rowStep)
             {
-                if (m_grid[col, row] == CellState.Empty) continue;
+                if (m_grid.Cells[col, row] == CellState.Empty) continue;
 
                 // 使用拖拽开始时缓存的覆盖状态（包含碰撞器覆盖 + 容器内部封闭的水）
-                int idx = col + row * m_columns;
-                bool isInsideDraggedObject = m_draggedCoverage != null && idx >= 0 && idx < m_draggedCoverage.Length && m_draggedCoverage[idx];
+                int idx = col + row * m_grid.Columns;
+                bool isInsideDraggedObject = m_owner.m_draggedCoverage != null && idx >= 0 && idx < m_owner.m_draggedCoverage.Length && m_owner.m_draggedCoverage[idx];
                 if (!isInsideDraggedObject) continue;
 
                 int newCol = col + offsetCol;
                 int newRow = row + offsetRow;
 
-                if (newCol < 0 || newCol >= m_columns || newRow < 0 || newRow >= m_rows)
+                if (newCol < 0 || newCol >= m_grid.Columns || newRow < 0 || newRow >= m_grid.Rows)
                     continue;
 
                 // 目标为空才移动，否则保留原位（不覆盖、不丢失）
-                if (m_nextGrid[newCol, newRow] == CellState.Empty)
+                if (m_grid.NextCells[newCol, newRow] == CellState.Empty)
                 {
-                    m_nextGrid[col, row] = CellState.Empty;
-                    m_nextGrid[newCol, newRow] = m_grid[col, row];
-                    m_nextLiquidColorGrid[newCol, newRow] = m_liquidColorGrid[col, row];
+                    m_grid.NextCells[col, row] = CellState.Empty;
+                    m_grid.NextCells[newCol, newRow] = m_grid.Cells[col, row];
+                    m_grid.NextLiquidColors[newCol, newRow] = m_grid.LiquidColors[col, row];
                 }
             }
         }
 
         // 交换：结果写回 m_grid
-        var temp = m_grid;
-        m_grid = m_nextGrid;
-        m_nextGrid = temp;
+        m_grid.SwapSimulationBuffers();
 
-        var tempColor = m_liquidColorGrid;
-        m_liquidColorGrid = m_nextLiquidColorGrid;
-        m_nextLiquidColorGrid = tempColor;
-
-        m_dragOffsetX = 0;
-        m_dragOffsetY = 0;
-        m_isDirty = true;
+        m_owner.m_dragOffsetX = 0;
+        m_owner.m_dragOffsetY = 0;
+        m_owner.m_isDirty = true;
     }
 
     /// <summary>
@@ -628,13 +666,13 @@ public partial class LayerGridPainter
     /// </summary>
     private bool DraggedObjectContainsLiquid()
     {
-        if (m_draggedCoverage == null || m_grid == null) return false;
-        for (int i = 0; i < m_draggedCoverage.Length; i++)
+        if (m_owner.m_draggedCoverage == null || m_grid.Cells == null) return false;
+        for (int i = 0; i < m_owner.m_draggedCoverage.Length; i++)
         {
-            if (!m_draggedCoverage[i]) continue;
-            int col = i % m_columns;
-            int row = i / m_columns;
-            if (m_grid[col, row] == CellState.Water || m_grid[col, row] == CellState.Bubble)
+            if (!m_owner.m_draggedCoverage[i]) continue;
+            int col = i % m_grid.Columns;
+            int row = i / m_grid.Columns;
+            if (m_grid.Cells[col, row] == CellState.Water || m_grid.Cells[col, row] == CellState.Bubble)
                 return true;
         }
         return false;
@@ -647,61 +685,58 @@ public partial class LayerGridPainter
     /// </summary>
     private void StartPour()
     {
-        if (m_draggedObject == null || m_draggedCoverage == null || m_grid == null || m_nextGrid == null)
+        if (m_owner.m_draggedObject == null || m_owner.m_draggedCoverage == null || m_grid.Cells == null || m_grid.NextCells == null)
             return;
 
         Matrix4x4 startM = Matrix4x4.TRS(m_dragStartObjPos, m_dragStartObjRot, Vector3.one);
-        Matrix4x4 curM = m_draggedObject.transform.localToWorldMatrix;
+        Matrix4x4 curM = m_owner.m_draggedObject.transform.localToWorldMatrix;
         Matrix4x4 T = curM * startM.inverse;
 
-        Array.Copy(m_grid, m_nextGrid, m_grid.Length);
-        if (m_liquidColorGrid != null && m_nextLiquidColorGrid != null)
-            Array.Copy(m_liquidColorGrid, m_nextLiquidColorGrid, m_liquidColorGrid.Length);
+        m_grid.CopyCurrentToNext();
 
         // 1. 清空被拖拽物体覆盖的格子（杯壁障碍 + 内部液体），稍后按新姿态重新放置液体
-        for (int row = 0; row < m_rows; row++)
+        for (int row = 0; row < m_grid.Rows; row++)
         {
-            for (int col = 0; col < m_columns; col++)
+            for (int col = 0; col < m_grid.Columns; col++)
             {
-                int idx = col + row * m_columns;
-                if (!m_draggedCoverage[idx]) continue;
-                CellState s = m_nextGrid[col, row];
+                int idx = col + row * m_grid.Columns;
+                if (!m_owner.m_draggedCoverage[idx]) continue;
+                CellState s = m_grid.NextCells[col, row];
                 if (s == CellState.Water || s == CellState.Bubble || s == CellState.Obstacle)
                 {
-                    m_nextGrid[col, row] = CellState.Empty;
-                    m_nextLiquidColorGrid[col, row] = Color.clear;
+                    m_grid.NextCells[col, row] = CellState.Empty;
+                    m_grid.NextLiquidColors[col, row] = Color.clear;
                 }
             }
         }
 
         // 2. 把液体格子按杯体当前姿态（平移 + 旋转）重新放回网格
-        for (int row = 0; row < m_rows; row++)
+        for (int row = 0; row < m_grid.Rows; row++)
         {
-            for (int col = 0; col < m_columns; col++)
+            for (int col = 0; col < m_grid.Columns; col++)
             {
-                int idx = col + row * m_columns;
-                if (!m_draggedCoverage[idx]) continue;
-                CellState s = m_grid[col, row];
+                int idx = col + row * m_grid.Columns;
+                if (!m_owner.m_draggedCoverage[idx]) continue;
+                CellState s = m_grid.Cells[col, row];
                 if (s != CellState.Water && s != CellState.Bubble) continue;
 
-                Vector2 startWorld = GetWorldPosition(col, row);
+                Vector2 startWorld = m_grid.GetWorldPosition(col, row);
                 Vector3 tw = T.MultiplyPoint((Vector3)startWorld);
-                int nc = Mathf.FloorToInt((tw.x - m_originX) / cellSize);
-                int nr = Mathf.FloorToInt((tw.y - m_originY) / cellSize);
-                if (nc < 0 || nc >= m_columns || nr < 0 || nr >= m_rows) continue;
+                int nc = Mathf.FloorToInt((tw.x - m_grid.OriginX) / m_grid.CellSize);
+                int nr = Mathf.FloorToInt((tw.y - m_grid.OriginY) / m_grid.CellSize);
+                if (nc < 0 || nc >= m_grid.Columns || nr < 0 || nr >= m_grid.Rows) continue;
 
-                m_nextGrid[nc, nr] = s;
-                m_nextLiquidColorGrid[nc, nr] = m_liquidColorGrid[col, row];
+                m_grid.NextCells[nc, nr] = s;
+                m_grid.NextLiquidColors[nc, nr] = m_grid.LiquidColors[col, row];
             }
         }
 
         // 交换网格
-        var tg = m_grid; m_grid = m_nextGrid; m_nextGrid = tg;
-        var tcg = m_liquidColorGrid; m_liquidColorGrid = m_nextLiquidColorGrid; m_nextLiquidColorGrid = tcg;
+        m_grid.SwapSimulationBuffers();
 
         // 3. 解除粘合：液体成为自由模拟水，由水模拟负责从杯口流出
-        m_draggedCoverage = null;
-        m_isDirty = true;
+        m_owner.m_draggedCoverage = null;
+        m_owner.m_isDirty = true;
     }
 
     /// <summary>
@@ -718,24 +753,24 @@ public partial class LayerGridPainter
 
         // 旋转中心量化到「半格」：这样 90° 整数旋转在网格上仍是严格双射，
         // 不会出现两个格子塌缩到同一个目标格导致水量凭空丢失（杯子越大越明显）。
-        float centerColF = (centerWorld.x - m_originX) / cellSize - 0.5f;
-        float centerRowF = (centerWorld.y - m_originY) / cellSize - 0.5f;
+        float centerColF = (centerWorld.x - m_grid.OriginX) / m_grid.CellSize - 0.5f;
+        float centerRowF = (centerWorld.y - m_grid.OriginY) / m_grid.CellSize - 0.5f;
         m_rotCenterColF = Mathf.RoundToInt(centerColF * 2f) * 0.5f;
         m_rotCenterRowF = Mathf.RoundToInt(centerRowF * 2f) * 0.5f;
 
-        if (m_draggedCoverage == null || m_grid == null) return;
-        for (int row = 0; row < m_rows; row++)
+        if (m_owner.m_draggedCoverage == null || m_grid.Cells == null) return;
+        for (int row = 0; row < m_grid.Rows; row++)
         {
-            for (int col = 0; col < m_columns; col++)
+            for (int col = 0; col < m_grid.Columns; col++)
             {
-                int idx = col + row * m_columns;
-                if (!m_draggedCoverage[idx]) continue;
-                CellState s = m_grid[col, row];
+                int idx = col + row * m_grid.Columns;
+                if (!m_owner.m_draggedCoverage[idx]) continue;
+                CellState s = m_grid.Cells[col, row];
                 if (s == CellState.Empty) continue; // 只快照非空（水/气泡/障碍）
                 m_rotSnapCol.Add(col);
                 m_rotSnapRow.Add(row);
                 m_rotSnapState.Add(s);
-                m_rotSnapColor.Add(m_liquidColorGrid != null ? m_liquidColorGrid[col, row] : Color.clear);
+                m_rotSnapColor.Add(m_grid.LiquidColors != null ? m_grid.LiquidColors[col, row] : Color.clear);
             }
         }
     }
@@ -746,7 +781,7 @@ public partial class LayerGridPainter
     /// </summary>
     private void TransformDraggedContents(float angleDeg)
     {
-        if (m_grid == null) return;
+        if (m_grid.Cells == null) return;
 
         // 0. 把快照对应的「原始格子」从网格中抬起（清空）。
         //    关键修复：CaptureRotSnapshot 只复制了状态、并未清除原格子，
@@ -756,10 +791,10 @@ public partial class LayerGridPainter
         {
             int c = m_rotSnapCol[i];
             int r = m_rotSnapRow[i];
-            if (c >= 0 && c < m_columns && r >= 0 && r < m_rows)
+            if (c >= 0 && c < m_grid.Columns && r >= 0 && r < m_grid.Rows)
             {
-                m_grid[c, r] = CellState.Empty;
-                if (m_liquidColorGrid != null) m_liquidColorGrid[c, r] = Color.clear;
+                m_grid.Cells[c, r] = CellState.Empty;
+                if (m_grid.LiquidColors != null) m_grid.LiquidColors[c, r] = Color.clear;
             }
         }
 
@@ -767,10 +802,10 @@ public partial class LayerGridPainter
         for (int i = 0; i < m_rotLastWritten.Count; i++)
         {
             Vector2Int p = m_rotLastWritten[i];
-            if (p.x >= 0 && p.x < m_columns && p.y >= 0 && p.y < m_rows)
+            if (p.x >= 0 && p.x < m_grid.Columns && p.y >= 0 && p.y < m_grid.Rows)
             {
-                m_grid[p.x, p.y] = CellState.Empty;
-                if (m_liquidColorGrid != null) m_liquidColorGrid[p.x, p.y] = Color.clear;
+                m_grid.Cells[p.x, p.y] = CellState.Empty;
+                if (m_grid.LiquidColors != null) m_grid.LiquidColors[p.x, p.y] = Color.clear;
             }
         }
         m_rotLastWritten.Clear();
@@ -797,26 +832,26 @@ public partial class LayerGridPainter
             }
             int nc = cc + ndc;
             int nr = cr + ndr;
-            if (nc < 0 || nc >= m_columns || nr < 0 || nr >= m_rows)
+            if (nc < 0 || nc >= m_grid.Columns || nr < 0 || nr >= m_grid.Rows)
             {
                 // 旋转后越界：尽量保留在原格，避免凭空丢失水量（仅当原格仍为空）
                 int oc = m_rotSnapCol[i];
                 int or = m_rotSnapRow[i];
-                if (oc >= 0 && oc < m_columns && or >= 0 && or < m_rows
-                    && m_grid[oc, or] == CellState.Empty)
+                if (oc >= 0 && oc < m_grid.Columns && or >= 0 && or < m_grid.Rows
+                    && m_grid.Cells[oc, or] == CellState.Empty)
                 {
-                    m_grid[oc, or] = m_rotSnapState[i];
-                    if (m_liquidColorGrid != null) m_liquidColorGrid[oc, or] = m_rotSnapColor[i];
+                    m_grid.Cells[oc, or] = m_rotSnapState[i];
+                    if (m_grid.LiquidColors != null) m_grid.LiquidColors[oc, or] = m_rotSnapColor[i];
                     m_rotLastWritten.Add(new Vector2Int(oc, or));
                 }
                 continue;
             }
 
-            m_grid[nc, nr] = m_rotSnapState[i];
-            if (m_liquidColorGrid != null) m_liquidColorGrid[nc, nr] = m_rotSnapColor[i];
+            m_grid.Cells[nc, nr] = m_rotSnapState[i];
+            if (m_grid.LiquidColors != null) m_grid.LiquidColors[nc, nr] = m_rotSnapColor[i];
             m_rotLastWritten.Add(new Vector2Int(nc, nr));
         }
-        m_isDirty = true;
+        m_owner.m_isDirty = true;
     }
 
     private void ClearRotSnapshot()
@@ -830,7 +865,7 @@ public partial class LayerGridPainter
 
     /// <summary>
     /// 右键拖拽旋转：作用于左键拖拽的物体（m_draggedObject），把旋转量量化到 90° 的整数倍。
-    /// 旋转期间水物理模拟已暂停（见 Update），杯内液体随杯体刚性同步旋转（不流动、不倒）；
+    /// 旋转期间水物理模拟已暂停（见协调器 Update），杯内液体随杯体刚性同步旋转（不流动、不倒）；
     /// 松开右键后物理恢复，倾斜/倒置的杯子会自然把液体倒出。
     /// 杯体保持旋转后的姿态，不自动回正（属于有意旋转）。
     /// </summary>
@@ -852,7 +887,7 @@ public partial class LayerGridPainter
                 // 重新接入旋转目标所需的内部状态：
                 // 左键松手时已清空 m_draggedObject / m_draggedObjColliders / m_draggedCoverage，
                 // 这里必须把它们按当前（静止）姿态重建，否则 CacheDraggedCoverage 会因碰撞器为 null 直接返回，倾倒不可用。
-                m_draggedObject = target;
+                m_owner.m_draggedObject = target;
                 m_draggedObjColliders = GetDraggedColliders();
                 m_dragStartObjPos = target.transform.position;
                 m_dragStartObjRot = target.transform.rotation;
@@ -886,7 +921,7 @@ public partial class LayerGridPainter
             while (delta < -180f) delta += 360f;
             float snapped = Mathf.Round(delta / 90f) * 90f; // 量化到 90° 倍数
             m_rotTarget.transform.rotation = m_rotStartObjRot * Quaternion.Euler(0f, 0f, snapped);
-            m_isDirty = true;
+            m_owner.m_isDirty = true;
             if (m_rotSnapCol.Count > 0)
                 TransformDraggedContents(snapped);
         }
@@ -897,12 +932,12 @@ public partial class LayerGridPainter
             m_isRotating = false;
             ClearRotSnapshot(); // 释放快照，水已按最终姿态留在网格中，物理恢复后自然倾倒
             // 若并非左键拖拽中（说明是单独右键旋转），清理目标引用，避免遗留
-            if (!m_isDragging)
+            if (!m_owner.m_isDragging)
             {
-                m_draggedObject = null;
-                m_draggedCoverage = null;
+                m_owner.m_draggedObject = null;
+                m_owner.m_draggedCoverage = null;
                 // 单独右键旋转结束：强制下一帧重扫障碍物，确保旋转后杯壁障碍落点准确
-                m_sceneDirty = true;
+                m_owner.m_sceneDirty = true;
             }
 
             // 取消选中：右键松开后清空旋转目标与「最近拖拽物体」，
@@ -922,7 +957,7 @@ public partial class LayerGridPainter
         Collider2D targetHit = null;
         foreach (var h in hits)
         {
-            if (h != null && !h.isTrigger && m_draggableTagSet.Contains(h.tag))
+            if (h != null && !h.isTrigger && m_owner.m_draggableTagSet.Contains(h.tag))
             {
                 targetHit = h;
                 break;
@@ -934,9 +969,9 @@ public partial class LayerGridPainter
         while (root.transform.parent != null)
         {
             GameObject parent = root.transform.parent.gameObject;
-            if (m_draggableTagSet.Contains(parent.tag))
+            if (m_owner.m_draggableTagSet.Contains(parent.tag))
             {
-                if (m_draggableTagSet.Contains(root.tag) && root.tag != parent.tag)
+                if (m_owner.m_draggableTagSet.Contains(root.tag) && root.tag != parent.tag)
                     break;
                 root = parent;
             }
