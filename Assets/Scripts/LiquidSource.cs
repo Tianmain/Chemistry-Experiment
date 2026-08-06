@@ -14,13 +14,22 @@ public class LiquidSource : MonoBehaviour
     public string liquidType = "Water";
 
     [Tooltip("液体显示颜色（若关联了 Reagent Data 且 Use Reagent Color 为 true，则优先使用试剂颜色）")]
-    public Color liquidColor = new Color(0.2f, 0.5f, 1f, 0.6f);
+    public Color liquidColor = ChemistryConstants.DefaultLiquidColor;
 
     [Tooltip("是否优先使用关联试剂的颜色")]
     public bool useReagentColor = true;
 
+    [Tooltip("手动标记为空容器（可装液体但目前无液体）。勾选后无论试剂名为何都按 empty 处理；也可由「试剂/类型为 none」自动勾上")]
+    public bool isEmptyContainer = false;
+
     [Tooltip("用于确定液体区域的多边形碰撞器（留空则自动获取自身及子物体的所有 Collider2D）")]
     public Collider2D[] regionColliders;
+
+    /// <summary>
+    /// 空容器标记词：当试剂名或液体类型为 "none" 时，视为「可装液体但目前无液体」的空容器。
+    /// 这类容器不参与初始灌水，标签只显示 "none"。
+    /// </summary>
+    public const string EMPTY_MARKER = "none";
 
     /// <summary>
     /// 碰撞器是否已收集过（避免 ContainsPoint 重复调用 AutoCollectColliders）
@@ -31,6 +40,9 @@ public class LiquidSource : MonoBehaviour
     {
         AutoCollectColliders();
         SyncFromReagent();
+        // 若试剂名 / 类型 / 资产文件名为 "none"，自动标记为空容器（持久化到序列化字段，运行时稳定）
+        if (!isEmptyContainer && NameLooksEmpty())
+            isEmptyContainer = true;
     }
 
     private void Awake()
@@ -71,6 +83,59 @@ public class LiquidSource : MonoBehaviour
         if (useReagentColor && reagentData != null)
             return reagentData.GetDisplayColor();
         return liquidColor;
+    }
+
+    /// <summary>
+    /// 是否为空容器：满足以下任一即为真——
+    ///   1) 手动勾选了 isEmptyContainer；
+    ///   2) 液体类型 liquidType 为 "none"；
+    ///   3) 关联试剂 reagentData 的名称（reagentName / englishName）为 "none"；
+    ///   4) 关联试剂资产文件名为 "none"（兼容只改名没填名称字段的情况）。
+    /// 空容器表示「此处可以装液体，但当前没有液体」——不参与初始灌水，标签显示 "none"，液面透明。
+    /// </summary>
+    public bool IsEmpty()
+    {
+        if (isEmptyContainer) return true;
+        if (!string.IsNullOrEmpty(liquidType)
+            && liquidType.Equals(EMPTY_MARKER, System.StringComparison.OrdinalIgnoreCase))
+            return true;
+        if (reagentData != null)
+        {
+            if (!string.IsNullOrEmpty(reagentData.reagentName)
+                && reagentData.reagentName.Equals(EMPTY_MARKER, System.StringComparison.OrdinalIgnoreCase))
+                return true;
+            if (!string.IsNullOrEmpty(reagentData.englishName)
+                && reagentData.englishName.Equals(EMPTY_MARKER, System.StringComparison.OrdinalIgnoreCase))
+                return true;
+            // 资产文件名（ScriptableObject.name 即 Project 中的文件名）
+            if (!string.IsNullOrEmpty(reagentData.name)
+                && reagentData.name.Equals(EMPTY_MARKER, System.StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// 仅按「名称/类型/文件名」判断是否为空容器（不含手动标记），供 OnValidate 自动勾选使用。
+    /// </summary>
+    private bool NameLooksEmpty()
+    {
+        if (!string.IsNullOrEmpty(liquidType)
+            && liquidType.Equals(EMPTY_MARKER, System.StringComparison.OrdinalIgnoreCase))
+            return true;
+        if (reagentData != null)
+        {
+            if (!string.IsNullOrEmpty(reagentData.reagentName)
+                && reagentData.reagentName.Equals(EMPTY_MARKER, System.StringComparison.OrdinalIgnoreCase))
+                return true;
+            if (!string.IsNullOrEmpty(reagentData.englishName)
+                && reagentData.englishName.Equals(EMPTY_MARKER, System.StringComparison.OrdinalIgnoreCase))
+                return true;
+            if (!string.IsNullOrEmpty(reagentData.name)
+                && reagentData.name.Equals(EMPTY_MARKER, System.StringComparison.OrdinalIgnoreCase))
+                return true;
+        }
+        return false;
     }
 
     /// <summary>

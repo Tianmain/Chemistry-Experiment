@@ -170,7 +170,8 @@ public partial class LayerGridPainter
     /// </summary>
     private bool IsOverlappingWithObstacles()
     {
-        Collider2D[] colliders = GetDraggedColliders();
+        // 复用拖拽开始时缓存的碰撞器，避免每帧重新分配数组（拖拽期间碰撞器集合不变）
+        Collider2D[] colliders = m_draggedObjColliders ?? System.Array.Empty<Collider2D>();
         if (colliders.Length == 0) return false;
 
         foreach (var col in colliders)
@@ -335,6 +336,9 @@ public partial class LayerGridPainter
 
                 m_isDragging = true;
                 m_draggedObject = draggedRoot;
+                m_lastDraggedObject = draggedRoot; // 跨拖拽保留，供松手后右键旋转使用
+                m_pourStarted = false;
+                m_isPouring = false;
                 m_dragStartMousePos = mousePos;
                 m_dragStartObjPos = m_draggedObject.transform.position;
                 m_dragStartObjRot = m_draggedObject.transform.rotation;
@@ -359,7 +363,7 @@ public partial class LayerGridPainter
                     m_draggedObjOriginalBounds = targetHit.bounds;
                 }
 
-                // 缓存拖拽开始时每个格子是否被被拖拽物体覆盖（用于渲染时精确偏移）
+                // 缓存拖拽开始时每个格子是否被被拖拽物体覆盖（用于倾倒判定 / 渲染偏移）
                 CacheDraggedCoverage();
 
                 // 构建碰撞检测用的组合 LayerMask（障碍物 + 其他可拖拽物体）
@@ -395,8 +399,8 @@ public partial class LayerGridPainter
             Vector3 currentPos = m_draggedObject.transform.position;
             Vector3 smoothedPos = targetPos;
 
-            // 障碍物碰撞检测
-            bool shouldCheckCollision = m_combinedCollisionMask != 0 && GetDraggedColliders().Length > 0;
+            // 障碍物碰撞检测（复用缓存碰撞器，避免每帧分配）
+            bool shouldCheckCollision = m_combinedCollisionMask != 0 && m_draggedObjColliders != null && m_draggedObjColliders.Length > 0;
             if (shouldCheckCollision)
             {
                 // 先尝试整格目标位置
@@ -410,9 +414,9 @@ public partial class LayerGridPainter
                     // 计算移动方向
                     Vector3 moveDir = smoothedPos - currentPos;
 
-                    // 收集阻挡方向：遍历所有子碰撞器
+                    // 收集阻挡方向：遍历所有子碰撞器（复用缓存）
                     Vector2 blockedNormal = Vector2.zero;
-                    Collider2D[] draggedCols = GetDraggedColliders();
+                    Collider2D[] draggedCols = m_draggedObjColliders;
                     foreach (var draggedCol in draggedCols)
                     {
                         if (draggedCol == null || draggedCol.isTrigger) continue;
@@ -502,14 +506,24 @@ public partial class LayerGridPainter
                 m_dragOffsetY = m_lastValidDragPos.y - m_dragStartObjPos.y;
             }
 
+            // 倾倒由右键拖拽旋转触发（见 HandleRotateInput），不再使用滚轮
+
             m_isDirty = true;
         }
         else if (Input.GetMouseButtonUp(0))
         {
+            bool hadPour = m_pourStarted;
             if (m_isDragging && m_draggedObject != null)
             {
                 ApplyDragOffsetToGrid();
             }
+            m_dragOffsetX = 0;
+            m_dragOffsetY = 0;
+            // 未发生真实倾倒时把杯体转回直立，避免空杯一直歪着
+            if (!hadPour && m_draggedObject != null)
+                m_draggedObject.transform.rotation = m_dragStartObjRot;
+            m_isPouring = false;
+            m_pourStarted = false;
             // 恢复 Rigidbody2D 的原始状态
             if (m_draggedRigidbody != null)
             {
@@ -525,11 +539,21 @@ public partial class LayerGridPainter
 
             m_isDragging = false;
             m_draggedObject = null;
+            // 拖拽结束：强制下一帧重扫障碍物，确保物体最终落点的杯壁障碍准确无误
+            m_sceneDirty = true;
             if (fillObj != null)
                 fillObj.transform.localPosition = Vector3.zero;
         }
+
+        // 右键拖拽旋转：作用于左键拖拽的物体，量化到 90° 倍数（左键仍按住时也能旋转）
+        HandleRotateInput(cam);
     }
 
+    /// <summary>
+    /// 把左键拖拽产生的整格偏移提交到网格：将被拖拽物体覆盖的格子（水/气泡/障碍）
+    /// 整体平移 offsetCol/offsetRow。仅在松手时调用一次。
+    /// 逆运动方向遍历，保证连续块可整体平移而不丢失。
+    /// </summary>
     private void ApplyDragOffsetToGrid()
     {
         if (m_dragOffsetX == 0 && m_dragOffsetY == 0) return;
@@ -597,5 +621,327 @@ public partial class LayerGridPainter
         m_dragOffsetX = 0;
         m_dragOffsetY = 0;
         m_isDirty = true;
+    }
+
+    /// <summary>
+    /// 判断当前被拖拽物体（缓存的覆盖格）内是否含有液体/气泡
+    /// </summary>
+    private bool DraggedObjectContainsLiquid()
+    {
+        if (m_draggedCoverage == null || m_grid == null) return false;
+        for (int i = 0; i < m_draggedCoverage.Length; i++)
+        {
+            if (!m_draggedCoverage[i]) continue;
+            int col = i % m_columns;
+            int row = i / m_columns;
+            if (m_grid[col, row] == CellState.Water || m_grid[col, row] == CellState.Bubble)
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// 开始倾倒：把粘在源杯里的液体（连同杯壁障碍）按杯体当前姿态一次性刚性变换到新位置，
+    /// 然后解除液体与杯子的“粘合”，交还给水模拟。倾斜的杯口会让元胞自动机把液体自然流出。
+    /// 仅在本次拖拽中第一次触发倾倒时调用一次。
+    /// </summary>
+    private void StartPour()
+    {
+        if (m_draggedObject == null || m_draggedCoverage == null || m_grid == null || m_nextGrid == null)
+            return;
+
+        Matrix4x4 startM = Matrix4x4.TRS(m_dragStartObjPos, m_dragStartObjRot, Vector3.one);
+        Matrix4x4 curM = m_draggedObject.transform.localToWorldMatrix;
+        Matrix4x4 T = curM * startM.inverse;
+
+        Array.Copy(m_grid, m_nextGrid, m_grid.Length);
+        if (m_liquidColorGrid != null && m_nextLiquidColorGrid != null)
+            Array.Copy(m_liquidColorGrid, m_nextLiquidColorGrid, m_liquidColorGrid.Length);
+
+        // 1. 清空被拖拽物体覆盖的格子（杯壁障碍 + 内部液体），稍后按新姿态重新放置液体
+        for (int row = 0; row < m_rows; row++)
+        {
+            for (int col = 0; col < m_columns; col++)
+            {
+                int idx = col + row * m_columns;
+                if (!m_draggedCoverage[idx]) continue;
+                CellState s = m_nextGrid[col, row];
+                if (s == CellState.Water || s == CellState.Bubble || s == CellState.Obstacle)
+                {
+                    m_nextGrid[col, row] = CellState.Empty;
+                    m_nextLiquidColorGrid[col, row] = Color.clear;
+                }
+            }
+        }
+
+        // 2. 把液体格子按杯体当前姿态（平移 + 旋转）重新放回网格
+        for (int row = 0; row < m_rows; row++)
+        {
+            for (int col = 0; col < m_columns; col++)
+            {
+                int idx = col + row * m_columns;
+                if (!m_draggedCoverage[idx]) continue;
+                CellState s = m_grid[col, row];
+                if (s != CellState.Water && s != CellState.Bubble) continue;
+
+                Vector2 startWorld = GetWorldPosition(col, row);
+                Vector3 tw = T.MultiplyPoint((Vector3)startWorld);
+                int nc = Mathf.FloorToInt((tw.x - m_originX) / cellSize);
+                int nr = Mathf.FloorToInt((tw.y - m_originY) / cellSize);
+                if (nc < 0 || nc >= m_columns || nr < 0 || nr >= m_rows) continue;
+
+                m_nextGrid[nc, nr] = s;
+                m_nextLiquidColorGrid[nc, nr] = m_liquidColorGrid[col, row];
+            }
+        }
+
+        // 交换网格
+        var tg = m_grid; m_grid = m_nextGrid; m_nextGrid = tg;
+        var tcg = m_liquidColorGrid; m_liquidColorGrid = m_nextLiquidColorGrid; m_nextLiquidColorGrid = tcg;
+
+        // 3. 解除粘合：液体成为自由模拟水，由水模拟负责从杯口流出
+        m_draggedCoverage = null;
+        m_isDirty = true;
+    }
+
+    /// <summary>
+    /// 快照当前被旋转烧杯的内容物（水/气泡/杯壁障碍），供旋转期间随杯体刚性旋转。
+    /// 旋转中心取杯体世界中心，并换算为格子坐标（用于整数 90° 旋转）。
+    /// </summary>
+    private void CaptureRotSnapshot(Vector3 centerWorld)
+    {
+        m_rotSnapCol.Clear();
+        m_rotSnapRow.Clear();
+        m_rotSnapState.Clear();
+        m_rotSnapColor.Clear();
+        m_rotLastWritten.Clear();
+
+        // 旋转中心量化到「半格」：这样 90° 整数旋转在网格上仍是严格双射，
+        // 不会出现两个格子塌缩到同一个目标格导致水量凭空丢失（杯子越大越明显）。
+        float centerColF = (centerWorld.x - m_originX) / cellSize - 0.5f;
+        float centerRowF = (centerWorld.y - m_originY) / cellSize - 0.5f;
+        m_rotCenterColF = Mathf.RoundToInt(centerColF * 2f) * 0.5f;
+        m_rotCenterRowF = Mathf.RoundToInt(centerRowF * 2f) * 0.5f;
+
+        if (m_draggedCoverage == null || m_grid == null) return;
+        for (int row = 0; row < m_rows; row++)
+        {
+            for (int col = 0; col < m_columns; col++)
+            {
+                int idx = col + row * m_columns;
+                if (!m_draggedCoverage[idx]) continue;
+                CellState s = m_grid[col, row];
+                if (s == CellState.Empty) continue; // 只快照非空（水/气泡/障碍）
+                m_rotSnapCol.Add(col);
+                m_rotSnapRow.Add(row);
+                m_rotSnapState.Add(s);
+                m_rotSnapColor.Add(m_liquidColorGrid != null ? m_liquidColorGrid[col, row] : Color.clear);
+            }
+        }
+    }
+
+    /// <summary>
+    /// 把快照内容物按 90° 整数倍旋转（绕杯心）写回网格，使水随杯体同步旋转。
+    /// 每帧先清除上一帧写入的格子，再从快照按当前角度重排，避免累积/残留。
+    /// </summary>
+    private void TransformDraggedContents(float angleDeg)
+    {
+        if (m_grid == null) return;
+
+        // 0. 把快照对应的「原始格子」从网格中抬起（清空）。
+        //    关键修复：CaptureRotSnapshot 只复制了状态、并未清除原格子，
+        //    若不在此清除，原位置会一直残留一份静止的“幽灵”水/杯壁，
+        //    旋转时水看起来不跟随，旋转结束后幽灵水脱离杯子被桌面吸收或漏走，导致水量莫名减少。
+        for (int i = 0; i < m_rotSnapCol.Count; i++)
+        {
+            int c = m_rotSnapCol[i];
+            int r = m_rotSnapRow[i];
+            if (c >= 0 && c < m_columns && r >= 0 && r < m_rows)
+            {
+                m_grid[c, r] = CellState.Empty;
+                if (m_liquidColorGrid != null) m_liquidColorGrid[c, r] = Color.clear;
+            }
+        }
+
+        // 1. 清除上一帧写入的格子
+        for (int i = 0; i < m_rotLastWritten.Count; i++)
+        {
+            Vector2Int p = m_rotLastWritten[i];
+            if (p.x >= 0 && p.x < m_columns && p.y >= 0 && p.y < m_rows)
+            {
+                m_grid[p.x, p.y] = CellState.Empty;
+                if (m_liquidColorGrid != null) m_liquidColorGrid[p.x, p.y] = Color.clear;
+            }
+        }
+        m_rotLastWritten.Clear();
+
+        // 2. 计算 90° 整数倍对应的旋转（与 Quaternion.Euler(0,0,angleDeg) 同向：逆时针），用整数矩阵保证格子对齐
+        int q = ((Mathf.RoundToInt(angleDeg / 90f) % 4) + 4) % 4;
+
+        // 3. 逐格重排：在世界空间绕杯心旋转后映射回网格（杯心与 transform 旋转轴一致，水与杯体视觉同步）
+        for (int i = 0; i < m_rotSnapCol.Count; i++)
+        {
+            // 纯整数网格旋转：绕量化后的（半格）中心做 90° 整数旋转，是严格双射，
+            // 任意两个格子不会塌缩到同一目标格，水量必然守恒。
+            int cc = Mathf.RoundToInt(m_rotCenterColF);
+            int cr = Mathf.RoundToInt(m_rotCenterRowF);
+            int dc = m_rotSnapCol[i] - cc;
+            int dr = m_rotSnapRow[i] - cr;
+            int ndc, ndr;
+            switch (q)
+            {
+                case 1:  ndc = -dr; ndr = dc;  break;  // 逆时针 90°
+                case 2:  ndc = -dc; ndr = -dr; break;  // 180°
+                case 3:  ndc = dr;  ndr = -dc; break;  // 逆时针 270°（=顺时针 90°）
+                default: ndc = dc;  ndr = dr;  break;  // 0°
+            }
+            int nc = cc + ndc;
+            int nr = cr + ndr;
+            if (nc < 0 || nc >= m_columns || nr < 0 || nr >= m_rows)
+            {
+                // 旋转后越界：尽量保留在原格，避免凭空丢失水量（仅当原格仍为空）
+                int oc = m_rotSnapCol[i];
+                int or = m_rotSnapRow[i];
+                if (oc >= 0 && oc < m_columns && or >= 0 && or < m_rows
+                    && m_grid[oc, or] == CellState.Empty)
+                {
+                    m_grid[oc, or] = m_rotSnapState[i];
+                    if (m_liquidColorGrid != null) m_liquidColorGrid[oc, or] = m_rotSnapColor[i];
+                    m_rotLastWritten.Add(new Vector2Int(oc, or));
+                }
+                continue;
+            }
+
+            m_grid[nc, nr] = m_rotSnapState[i];
+            if (m_liquidColorGrid != null) m_liquidColorGrid[nc, nr] = m_rotSnapColor[i];
+            m_rotLastWritten.Add(new Vector2Int(nc, nr));
+        }
+        m_isDirty = true;
+    }
+
+    private void ClearRotSnapshot()
+    {
+        m_rotSnapCol.Clear();
+        m_rotSnapRow.Clear();
+        m_rotSnapState.Clear();
+        m_rotSnapColor.Clear();
+        m_rotLastWritten.Clear();
+    }
+
+    /// <summary>
+    /// 右键拖拽旋转：作用于左键拖拽的物体（m_draggedObject），把旋转量量化到 90° 的整数倍。
+    /// 旋转期间水物理模拟已暂停（见 Update），杯内液体随杯体刚性同步旋转（不流动、不倒）；
+    /// 松开右键后物理恢复，倾斜/倒置的杯子会自然把液体倒出。
+    /// 杯体保持旋转后的姿态，不自动回正（属于有意旋转）。
+    /// </summary>
+    private void HandleRotateInput(Camera cam)
+    {
+        // 右键按下：确定旋转目标
+        if (Input.GetMouseButtonDown(1))
+        {
+            // 优先旋转「最近一次被左键拖拽的物体」（即先松手、再用右键转的那只烧杯），
+            // 不要求鼠标必须压在杯子上；鼠标下没有可拖拽物体时再退回拾取。
+            GameObject target = m_lastDraggedObject;
+            if (target == null)
+            {
+                target = PickDraggableUnderMouse(cam);
+            }
+
+            if (target != null)
+            {
+                // 重新接入旋转目标所需的内部状态：
+                // 左键松手时已清空 m_draggedObject / m_draggedObjColliders / m_draggedCoverage，
+                // 这里必须把它们按当前（静止）姿态重建，否则 CacheDraggedCoverage 会因碰撞器为 null 直接返回，倾倒不可用。
+                m_draggedObject = target;
+                m_draggedObjColliders = GetDraggedColliders();
+                m_dragStartObjPos = target.transform.position;
+                m_dragStartObjRot = target.transform.rotation;
+                CacheDraggedCoverage();
+
+                // 快照当前烧杯内容物（水+杯壁），供旋转期间随杯体刚性旋转
+                CaptureRotSnapshot(target.transform.position);
+
+                m_rotTarget = target;
+                m_rotStartObjRot = target.transform.rotation;
+                Vector2 center = target.transform.position;
+                Vector2 mouse = cam.ScreenToWorldPoint(Input.mousePosition);
+                m_rotStartAngle = Mathf.Atan2(mouse.y - center.y, mouse.x - center.x) * Mathf.Rad2Deg;
+                m_isRotating = true;
+            }
+            else
+            {
+                m_isRotating = false;
+            }
+        }
+
+        // 右键持续拖拽：把累计角度量化到 90° 倍数并应用（水随杯体刚性旋转，整数双射不丢水）
+        if (m_isRotating && m_rotTarget != null && Input.GetMouseButton(1))
+        {
+            Vector2 center = m_rotTarget.transform.position;
+            Vector2 mouse = cam.ScreenToWorldPoint(Input.mousePosition);
+            float curAngle = Mathf.Atan2(mouse.y - center.y, mouse.x - center.x) * Mathf.Rad2Deg;
+            float delta = curAngle - m_rotStartAngle;
+            // 归一化到 [-180, 180]，避免跨越 ±180° 时跳变
+            while (delta > 180f) delta -= 360f;
+            while (delta < -180f) delta += 360f;
+            float snapped = Mathf.Round(delta / 90f) * 90f; // 量化到 90° 倍数
+            m_rotTarget.transform.rotation = m_rotStartObjRot * Quaternion.Euler(0f, 0f, snapped);
+            m_isDirty = true;
+            if (m_rotSnapCol.Count > 0)
+                TransformDraggedContents(snapped);
+        }
+
+        // 右键松开：结束旋转（杯体保持当前 90° 姿态，不回正）
+        if (Input.GetMouseButtonUp(1))
+        {
+            m_isRotating = false;
+            ClearRotSnapshot(); // 释放快照，水已按最终姿态留在网格中，物理恢复后自然倾倒
+            // 若并非左键拖拽中（说明是单独右键旋转），清理目标引用，避免遗留
+            if (!m_isDragging)
+            {
+                m_draggedObject = null;
+                m_draggedCoverage = null;
+                // 单独右键旋转结束：强制下一帧重扫障碍物，确保旋转后杯壁障碍落点准确
+                m_sceneDirty = true;
+            }
+
+            // 取消选中：右键松开后清空旋转目标与「最近拖拽物体」，
+            // 物体回到未选中状态，左键可直接去拖拽其他物体（不会残留旧的选中项）。
+            m_rotTarget = null;
+            m_lastDraggedObject = null;
+        }
+    }
+
+    /// <summary>
+    /// 拾取鼠标位置下的可拖拽物体（向上查找可拖拽根），用于右键单独旋转时的目标确定。
+    /// </summary>
+    private GameObject PickDraggableUnderMouse(Camera cam)
+    {
+        Vector2 mousePos = cam.ScreenToWorldPoint(Input.mousePosition);
+        Collider2D[] hits = Physics2D.OverlapPointAll(mousePos);
+        Collider2D targetHit = null;
+        foreach (var h in hits)
+        {
+            if (h != null && !h.isTrigger && m_draggableTagSet.Contains(h.tag))
+            {
+                targetHit = h;
+                break;
+            }
+        }
+        if (targetHit == null) return null;
+
+        GameObject root = targetHit.gameObject;
+        while (root.transform.parent != null)
+        {
+            GameObject parent = root.transform.parent.gameObject;
+            if (m_draggableTagSet.Contains(parent.tag))
+            {
+                if (m_draggableTagSet.Contains(root.tag) && root.tag != parent.tag)
+                    break;
+                root = parent;
+            }
+            else break;
+        }
+        return root;
     }
 }

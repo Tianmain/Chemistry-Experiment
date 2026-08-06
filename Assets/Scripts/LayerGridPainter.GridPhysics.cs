@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using UnityEngine;
 
 public partial class LayerGridPainter
@@ -14,7 +15,8 @@ public partial class LayerGridPainter
 
         bool changed = false;
 
-        if (m_obstacleLayerMask != 0)
+        // 仅在场景脏（物体/网格本体移动）时重扫障碍物。静止时障碍状态不变，跳过整段逐格 OverlapPoint。
+        if (m_sceneDirty && m_obstacleLayerMask != 0)
         {
             // 一次物理查询获取网格区域内所有障碍物碰撞器
             Vector2 center = new Vector2(m_originX + gridWidth * 0.5f, m_originY + gridHeight * 0.5f);
@@ -27,12 +29,12 @@ public partial class LayerGridPainter
                 {
                     if (IsBoundaryCell(col, row)) continue;
 
-                    Vector2 worldPos = GetWorldPosition(col, row);
+                    m_tempPoint.Set(m_originX + (col + 0.5f) * cellSize, m_originY + (row + 0.5f) * cellSize);
                     bool hasObstacle = false;
                     for (int i = 0; i < count; i++)
                     {
                         var c = m_colliderBuffer[i];
-                        if (!c.isTrigger && c.OverlapPoint(worldPos))
+                        if (!c.isTrigger && c.OverlapPoint(m_tempPoint))
                         {
                             hasObstacle = true;
                             break;
@@ -65,8 +67,11 @@ public partial class LayerGridPainter
         if (changed)
             m_isDirty = true;
 
-        // 吸收碰到 absorbTag 物体的水
+        // 吸收碰到 absorbTag 物体的水（水每 tick 都会流动到桌上，故始终运行；内部有前置快判）
         AbsorbWaterAtTaggedObjects();
+
+        // 本轮已处理，复位脏标记；下一帧若物体仍静止则跳过障碍重检
+        m_sceneDirty = false;
     }
 
     /// <summary>
@@ -99,17 +104,29 @@ public partial class LayerGridPainter
         {
             for (int row = 1; row < m_rows - 1; row++)
             {
-                Vector2 worldPos = GetWorldPosition(col, row);
+                // 前置快判：本格和正上方都没有水或气泡 → 这里不可能有东西被吸收，直接跳过整段 OverlapPoint。
+                // 干燥空气占网格绝大多数，此判断能把吸收扫描的 OverlapPoint 调用降到「仅水体附近」。
+                bool hasWaterHere = m_grid[col, row] == CellState.Water || m_grid[col, row] == CellState.Bubble;
+                bool hasWaterAbove = row + 1 < m_rows - 1
+                    && (m_grid[col, row + 1] == CellState.Water || m_grid[col, row + 1] == CellState.Bubble);
+                if (!hasWaterHere && !hasWaterAbove)
+                    continue;
+
+                m_tempPoint.Set(m_originX + (col + 0.5f) * cellSize, m_originY + (row + 0.5f) * cellSize);
                 bool onTable = false;
                 for (int i = 0; i < absorbCount; i++)
                 {
-                    if (m_colliderBuffer[i].OverlapPoint(worldPos))
+                    if (m_colliderBuffer[i].OverlapPoint(m_tempPoint))
                     {
                         onTable = true;
                         break;
                     }
                 }
                 if (!onTable) continue;
+
+                // 处于任意容器内部（LiquidRegion）的水不算「洒在桌上」，不要吸收，
+                // 这样从一只杯子倒进空杯子时液体能被接住、留在杯内累积。
+                if (IsInsideContainerInterior(m_tempPoint)) continue;
 
                 // Table 格本身有水或气泡 → 吸收
                 if (m_grid[col, row] == CellState.Water || m_grid[col, row] == CellState.Bubble)
@@ -121,6 +138,9 @@ public partial class LayerGridPainter
                 // Table 格正上方有水或气泡 → 吸收
                 if (row + 1 < m_rows - 1 && (m_grid[col, row + 1] == CellState.Water || m_grid[col, row + 1] == CellState.Bubble))
                 {
+                    // 正上方的水若处于容器内部（如在空杯子里），也不吸收
+                    m_tempPoint2.Set(m_originX + (col + 0.5f) * cellSize, m_originY + (row + 1.5f) * cellSize);
+                    if (IsInsideContainerInterior(m_tempPoint2)) continue;
                     m_grid[col, row + 1] = CellState.Empty;
                     m_liquidColorGrid[col, row + 1] = Color.clear;
                     absorbed = true;
@@ -130,6 +150,64 @@ public partial class LayerGridPainter
 
         if (absorbed)
             m_isDirty = true;
+    }
+
+    /// <summary>
+    /// 缓存所有「容器内部区域」碰撞器（LiquidRegion 子物体 + LiquidSource.regionColliders），
+    /// 用于吸收逻辑判断某水格是否处于容器内，从而不被桌面吸收。
+    /// 容器在场景中移动时碰撞器的世界坐标会自动更新，无需每帧重建。
+    /// 仅遍历已缓存的容器子树，避免 FindObjectsOfType&lt;Transform&gt; 对整个场景扫描。
+    /// </summary>
+    private void CacheContainerInteriors()
+    {
+        if (m_cachedLiquidSources == null) CacheLiquidSources();
+        var list = new List<Collider2D>();
+
+        if (m_cachedLiquidSources != null)
+        {
+            foreach (var s in m_cachedLiquidSources)
+            {
+                if (s == null) continue;
+
+                // 1) LiquidSource 自带的区域碰撞器（含空容器，通常已覆盖整个容器形状）
+                if (s.regionColliders != null)
+                {
+                    foreach (var c in s.regionColliders)
+                        if (c != null) list.Add(c);
+                }
+
+                // 2) 向上回溯到容器根，再收集名为 LiquidRegion 的子物体（兼容无 regionColliders 的遗留情况）。
+                //    仅扫描容器子树，而非全场景所有 Transform。
+                Transform root = s.transform;
+                while (root.parent != null) root = root.parent;
+                var regionTransforms = root.GetComponentsInChildren<Transform>();
+                foreach (var t in regionTransforms)
+                {
+                    if (t != null && t.name == "LiquidRegion")
+                    {
+                        var cols = t.GetComponents<Collider2D>();
+                        foreach (var c in cols)
+                            if (c != null) list.Add(c);
+                    }
+                }
+            }
+        }
+
+        m_containerInteriorColliders = list.ToArray();
+    }
+
+    /// <summary>
+    /// 判断某世界坐标是否处于任一容器内部（LiquidRegion 区域）。
+    /// 用于吸收逻辑：容器内部的水不应被桌面吸收，而是被杯子接住/保留。
+    /// </summary>
+    private bool IsInsideContainerInterior(Vector2 worldPos)
+    {
+        if (m_containerInteriorColliders == null || m_containerInteriorColliders.Length == 0) return false;
+        foreach (var c in m_containerInteriorColliders)
+        {
+            if (c != null && c.OverlapPoint(worldPos)) return true;
+        }
+        return false;
     }
 
     /// <summary>
@@ -447,6 +525,8 @@ public partial class LayerGridPainter
         // --- 间隙填充 pass ---
         // 水cell一侧有空格、另一侧有水时，向空格方向滑动以紧挨
         // 不检查 m_moved：允许主循环移动过的水继续滑动填满间隙
+        // 用每行最左/最右水格列（O(1) 预计算）替代原先每行 O(width) 的远端扫描，整体从 O(n^2) 降到 O(cells)。
+        ComputeWaterExtents();
         // Pass 1: 左→右（向右填间隙）
         for (int row = 1; row < m_rows - 1; row++)
         {
@@ -457,12 +537,7 @@ public partial class LayerGridPainter
                 // 目标格下方必须有支撑（否则应该往下掉，不是水平填）
                 if (m_nextGrid[col + 1, row - 1] == CellState.Empty && !IsBoundaryCell(col + 1, row - 1)) continue;
                 // 右侧远处必须有水（这是间隙，不是边缘扩散）
-                bool hasWaterRight = false;
-                for (int c = col + 2; c < m_columns - 1; c++)
-                {
-                    if (m_nextGrid[c, row] == CellState.Water) { hasWaterRight = true; break; }
-                }
-                if (!hasWaterRight) continue;
+                if (m_rowRightmostWater[row] <= col + 1) continue;
 
                 m_nextGrid[col, row] = CellState.Empty;
                 m_nextGrid[col + 1, row] = CellState.Water;
@@ -478,12 +553,8 @@ public partial class LayerGridPainter
                 if (m_nextGrid[col, row] != CellState.Water) continue;
                 if (m_nextGrid[col - 1, row] != CellState.Empty || IsBoundaryCell(col - 1, row)) continue;
                 if (m_nextGrid[col - 1, row - 1] == CellState.Empty && !IsBoundaryCell(col - 1, row - 1)) continue;
-                bool hasWaterLeft = false;
-                for (int c = col - 2; c >= 1; c--)
-                {
-                    if (m_nextGrid[c, row] == CellState.Water) { hasWaterLeft = true; break; }
-                }
-                if (!hasWaterLeft) continue;
+                // 左侧远处必须有水（这是间隙，不是边缘扩散）
+                if (m_rowLeftmostWater[row] < 0 || m_rowLeftmostWater[row] >= col - 1) continue;
 
                 m_nextGrid[col, row] = CellState.Empty;
                 m_nextGrid[col - 1, row] = CellState.Water;
@@ -568,6 +639,34 @@ public partial class LayerGridPainter
                     m_nextLiquidColorGrid[col, row].a = Mathf.Lerp(srcColor.a, avgA, mixingDiffusionRate);
                     m_colorDiffused = true;
                 }
+            }
+        }
+    }
+
+    /// <summary>
+    /// 预计算每行最左/最右的水格列索引（基于本步开始时的 m_nextGrid 快照），
+    /// 供间隙填充 pass 以 O(1) 判断「远端是否还有水」，避免逐格 O(width) 扫描。
+    /// </summary>
+    private void ComputeWaterExtents()
+    {
+        if (m_rowRightmostWater == null || m_rowRightmostWater.Length != m_rows)
+            m_rowRightmostWater = new int[m_rows];
+        if (m_rowLeftmostWater == null || m_rowLeftmostWater.Length != m_rows)
+            m_rowLeftmostWater = new int[m_rows];
+
+        for (int row = 1; row < m_rows - 1; row++)
+        {
+            m_rowRightmostWater[row] = -1;
+            m_rowLeftmostWater[row] = -1;
+        }
+
+        for (int row = 1; row < m_rows - 1; row++)
+        {
+            for (int col = 1; col < m_columns - 1; col++)
+            {
+                if (m_nextGrid[col, row] != CellState.Water) continue;
+                if (m_rowRightmostWater[row] < col) m_rowRightmostWater[row] = col;
+                if (m_rowLeftmostWater[row] < 0 || m_rowLeftmostWater[row] > col) m_rowLeftmostWater[row] = col;
             }
         }
     }

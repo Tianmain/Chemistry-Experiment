@@ -60,7 +60,7 @@ namespace Chemistry
 
         [Header("物理性质")]
         [Tooltip("在模拟中显示的液体颜色")]
-        public Color displayColor = new Color(0.2f, 0.5f, 1f, 0.6f);
+        public Color displayColor = ChemistryConstants.DefaultLiquidColor;
 
         [Tooltip("常温常压下的物态")]
         public PhysicalState defaultState = PhysicalState.Liquid;
@@ -116,7 +116,7 @@ namespace Chemistry
         {
             if (displayColor.a > 0.001f)
                 return displayColor;
-            return new Color(0.2f, 0.5f, 1f, 0.6f);
+            return ChemistryConstants.DefaultLiquidColor;
         }
 
         /// <summary>
