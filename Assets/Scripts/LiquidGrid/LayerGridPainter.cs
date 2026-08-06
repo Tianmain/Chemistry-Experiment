@@ -22,6 +22,47 @@ public class MutualBlockRule
 }
 
 /// <summary>
+/// 接触吸附规则：一条规则 = 载体标签 + 货物标签 + 接触传感器(碰撞体引用) + 判定参数。
+/// 货物碰到载体的接触传感器（推荐：直接在 Inspector 把传感器碰撞体拖到 Sensor 字段；
+/// 也可留空让其按 sensorChildName / 首个子碰撞器自动查找）时，
+/// 会被挂为载体的子物体，从而随载体一起移动（拖拽碰撞范围自动变为两者之和）；
+/// 单独拖动货物则立即脱离，放回接触区会在“刚进入接触”的上升沿重新吸附。
+/// 配置字段会序列化到 Inspector；运行时缓存字段标 [System.NonSerialized]，不进入序列化。
+/// </summary>
+[Serializable]
+public class AttachRule
+{
+    [Tooltip("是否启用本规则。")]
+    public bool enabled = true;
+
+    [Tooltip("载体标签，例如 Tripod。系统会找到所有带此标签的物体作为载体。")]
+    public string carrierTag = "Tripod";
+
+    [Tooltip("货物标签，例如 Asbestos_Mesh。")]
+    public string cargoTag = "Asbestos_Mesh";
+
+    [Tooltip("直接在 Inspector 里把载体上的接触传感器碰撞体拖进来即可（推荐），不必填名字。")]
+    public Collider2D sensor;
+
+    [Tooltip("兜底：当上方未指定碰撞体时，按此子物体名称（应为 IsTrigger 碰撞器）在载体下查找；留空则自动取第一个子碰撞器。")]
+    public string sensorChildName = "Trigger";
+
+    [Tooltip("接触判定容差（世界单位）。略大于 0 可让“刚好搭在边缘”也算接触。")]
+    public float touchTolerance = 0.05f;
+
+    [Tooltip("当货物自身被拖动时，是否立即脱离载体（默认开启，使货物可独立移动）。")]
+    public bool detachWhenCargoDragged = true;
+
+    // ---- 运行时缓存（不序列化）----
+    [System.NonSerialized] public List<GameObject> carriers = new List<GameObject>();
+    [System.NonSerialized] public List<GameObject> cargos = new List<GameObject>();
+    [System.NonSerialized] public Dictionary<GameObject, Collider2D> sensorCache = new Dictionary<GameObject, Collider2D>();
+    [System.NonSerialized] public Dictionary<GameObject, bool> prevTouching = new Dictionary<GameObject, bool>();
+    [System.NonSerialized] public int lastCarrierCount = -1;
+    [System.NonSerialized] public int lastCargoCount = -1;
+}
+
+/// <summary>
 /// 水网格模拟器（协调器）——基于网格的水流动模拟。
 /// 检测场景中 Water Layer 的物体作为初始水源，水受到重力自然往下流；
 /// 遇到 Obstacle Layer 的物体停止向下流动，可以向左/右流动。
@@ -94,6 +135,11 @@ public class LayerGridPainter : MonoBehaviour
 
     [Tooltip("互相阻碍的 Tag 对列表（如 Alcohol_Lamp 和 Tripod 会互相阻挡）")]
     public MutualBlockRule[] mutualBlockRules;
+
+    [Header("接触吸附规则")]
+    [Tooltip("载体标签 ↔ 货物标签 的吸附规则表。每条登记一对：货物碰到载体顶部接触传感器即挂为子物体，随载体移动。" +
+             "例如 carrierTag=Tripod, cargoTag=Asbestos_Mesh，并把三脚架顶部的 Trigger 碰撞体直接拖到 Sensor 字段。")]
+    public List<AttachRule> attachRules = new List<AttachRule>();
 
     [Header("液体混合")]
     [Tooltip("液体混合扩散速率（0=不混合，0.1=每步向邻居颜色靠近10%）")]
@@ -239,6 +285,9 @@ public class LayerGridPainter : MonoBehaviour
         {
             m_dragger.HandleDrag();
 
+            // 接触吸附规则：处理“货物碰到载体即挂为子物体、随载体移动、单独拖则脱开”
+            EvaluateAttachRules();
+
             // 检测场景是否真的移动（拖拽物体位移/旋转，或网格本体移动）。
             // 仅在移动时才需要重新扫描障碍物；静止时 UpdateGridFromObjects 会跳过昂贵的逐格 OverlapPoint 重检。
             if (transform.position != m_lastPainterPos)
@@ -371,6 +420,160 @@ public class LayerGridPainter : MonoBehaviour
     internal void CacheLiquidSources()
     {
         m_cachedLiquidSources = FindObjectsOfType<LiquidSource>();
+    }
+
+    #endregion
+
+    #region 接触吸附规则（载体 + 货物）
+
+    /// <summary>
+    /// 每帧遍历所有吸附规则并求值。把货物挂到载体下成为子物体，使拖/推载体时货物随之移动、
+    /// 拖拽碰撞范围变为两者之和；单独拖货物则立即脱离；放回接触区在“刚进入接触”的上升沿重新吸附。
+    /// </summary>
+    private void EvaluateAttachRules()
+    {
+        if (attachRules == null || attachRules.Count == 0) return;
+        foreach (var rule in attachRules)
+        {
+            if (rule != null && rule.enabled) EvaluateAttachRule(rule);
+        }
+    }
+
+    private void EvaluateAttachRule(AttachRule rule)
+    {
+        GameObject[] carriersArr;
+        GameObject[] cargosArr;
+        try
+        {
+            carriersArr = GameObject.FindGameObjectsWithTag(rule.carrierTag);
+            cargosArr = GameObject.FindGameObjectsWithTag(rule.cargoTag);
+        }
+        catch (UnityException)
+        {
+            Debug.LogError($"[LayerGridPainter] 吸附规则中的标签 “{rule.carrierTag}” 或 “{rule.cargoTag}” 未在 TagManager 注册，已停用该规则。", this);
+            rule.enabled = false;
+            return;
+        }
+
+        // 仅在载体 / 货物数量变化时重新扫描（兼顾运行中实例化新物体），并清掉失效的传感器缓存
+        if (carriersArr.Length != rule.lastCarrierCount)
+        {
+            rule.carriers = new List<GameObject>(carriersArr);
+            rule.lastCarrierCount = carriersArr.Length;
+            rule.sensorCache.Clear();
+        }
+        if (cargosArr.Length != rule.lastCargoCount)
+        {
+            rule.cargos = new List<GameObject>(cargosArr);
+            rule.lastCargoCount = cargosArr.Length;
+        }
+
+        if (rule.carriers.Count == 0 || rule.cargos.Count == 0) return;
+
+        foreach (var cargo in rule.cargos)
+        {
+            if (cargo == null) continue;
+
+            // 当前是否已吸附（父物体是某个载体）
+            Transform parent = cargo.transform.parent;
+            GameObject attachedCarrier = (parent != null) ? parent.gameObject : null;
+            bool isAttached = attachedCarrier != null && rule.carriers.Contains(attachedCarrier);
+
+            // 找正在接触（或容差内）的载体
+            GameObject touchingCarrier = null;
+            foreach (var carrier in rule.carriers)
+            {
+                Collider2D sensor = GetAttachSensor(rule, carrier);
+                if (sensor != null && IsCargoTouching(cargo, sensor, rule.touchTolerance))
+                {
+                    touchingCarrier = carrier;
+                    break;
+                }
+            }
+
+            bool beingDragged = rule.detachWhenCargoDragged
+                                && m_isDragging
+                                && m_draggedObject == cargo;
+
+            if (isAttached)
+            {
+                // 已吸附：货物被单独拖动、或离开接触区 -> 脱离
+                if (beingDragged || touchingCarrier == null) DetachCargo(cargo);
+            }
+            else
+            {
+                // 未吸附：只要货物接触载体且当前没被拖动就吸附。
+                // 拖动中 beingDragged 为真 → 不会吸附；松手后才会吸附，避免拖动时抖动。
+                // 注意：不再要求“刚进入接触区的上升沿(!prev)”——否则手动把货物拖到载体上方松手后，
+                // prevTouching 已被上一帧（拖动中）置为 true，吸附条件永远不满足，货物永远吸不上。
+                if (touchingCarrier != null && !beingDragged) AttachCargo(cargo, touchingCarrier);
+            }
+
+            rule.prevTouching[cargo] = touchingCarrier != null;
+        }
+    }
+
+    /// <summary>取载体上的接触传感器：优先用规则直接指定的碰撞体引用，否则按 sensorChildName 找子物体，再否则取第一个子碰撞器。</summary>
+    private Collider2D GetAttachSensor(AttachRule rule, GameObject carrier)
+    {
+        if (rule.sensorCache.TryGetValue(carrier, out var cached) && cached != null) return cached;
+
+        Collider2D sensor = null;
+
+        // 1) 规则直接指定的碰撞体引用：仅当它属于当前载体（或载体子孙）时才采用
+        if (rule.sensor != null
+            && (rule.sensor.gameObject == carrier || rule.sensor.transform.IsChildOf(carrier.transform)))
+        {
+            sensor = rule.sensor;
+        }
+
+        // 2) 兜底：按名字找子物体
+        if (sensor == null && !string.IsNullOrEmpty(rule.sensorChildName))
+        {
+            var t = carrier.transform.Find(rule.sensorChildName);
+            if (t != null) sensor = t.GetComponent<Collider2D>();
+        }
+
+        // 3) 再兜底：第一个子碰撞器（优先 Trigger）
+        if (sensor == null)
+        {
+            Collider2D firstAny = null;
+            foreach (var c in carrier.GetComponentsInChildren<Collider2D>())
+            {
+                if (c == null || c.gameObject == carrier) continue; // 跳过载体自身碰撞器
+                if (firstAny == null) firstAny = c;
+                if (c.isTrigger) { sensor = c; break; }
+            }
+            if (sensor == null) sensor = firstAny;
+        }
+
+        rule.sensorCache[carrier] = sensor;
+        return sensor;
+    }
+
+    private static bool IsCargoTouching(GameObject cargo, Collider2D sensor, float tol)
+    {
+        if (sensor == null) return false;
+        foreach (var c in cargo.GetComponentsInChildren<Collider2D>())
+        {
+            if (c == null || c.isTrigger) continue;
+            if (Physics2D.IsTouching(c, sensor)) return true;
+            var d = Physics2D.Distance(c, sensor);
+            if (d.isValid && d.distance < tol) return true;
+        }
+        return false;
+    }
+
+    private static void AttachCargo(GameObject cargo, GameObject carrier)
+    {
+        // 保留世界变换地把货物挂到载体之下；之后载体移动会带动货物，拖拽碰撞范围也变为两者之和
+        cargo.transform.SetParent(carrier.transform, true);
+    }
+
+    private static void DetachCargo(GameObject cargo)
+    {
+        // 保留世界变换地脱离，使货物留在当前位置、可自由移动
+        cargo.transform.SetParent(null, true);
     }
 
     #endregion

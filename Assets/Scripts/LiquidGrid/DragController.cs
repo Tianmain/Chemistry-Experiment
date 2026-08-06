@@ -222,6 +222,29 @@ public class DragController
                     m_owner.m_draggedCoverage[idx] = true;
             }
         }
+
+        // 4. 向上连通泛洪：从任意被覆盖格开始，向上把连续的 水/气泡 格也标记为跟随，
+        //    使“搁在杯壁/网格上的整柱水”随物体一起平移，而不只贴表面一格。
+        //    这样拖动三脚架（带动石棉网及其上的水）时，网面上的水能整体跟随，不会留在原地。
+        for (int col = 1; col < m_grid.Columns - 1; col++)
+        {
+            bool chainActive = false;
+            for (int row = 1; row < m_grid.Rows - 1; row++)
+            {
+                int idx = col + row * m_grid.Columns;
+                if (m_owner.m_draggedCoverage[idx])
+                {
+                    chainActive = true;   // 遇到被覆盖格，启动向上链路
+                    continue;
+                }
+                CellState st = m_grid.Cells[col, row];
+                bool isLiquid = st == CellState.Water || st == CellState.Bubble;
+                if (chainActive && isLiquid)
+                    m_owner.m_draggedCoverage[idx] = true;
+                else if (!isLiquid)
+                    chainActive = false;  // 遇到非液体且非覆盖格 → 链路断开
+            }
+        }
     }
 
     /// <summary>

@@ -4,8 +4,8 @@ using System.Text;
 
 /// <summary>
 /// 烧杯容量 / 液位标签。
-/// 显示：试剂名、体积(mL)、液位百分比，并在容器右侧绘制竖直液位条。
-/// 所有标签样式配置（字体大小、每格毫升数、偏移、底板、液位% 开关、液位条等）都只在本组件内定义一次，
+/// 显示：试剂名（液体种类）与体积(mL)。
+/// 所有标签样式配置（字体大小、每格毫升数、偏移、底板等）都只在本组件内定义一次，
 /// 由 LayerGridPainter 自动创建并只传入功能引用（painter / source），不重复定义任何样式。
 /// </summary>
 [DisallowMultipleComponent]
@@ -30,27 +30,16 @@ public class LiquidVolumeUI : MonoBehaviour
     public float backdropWidthScale = 1.1f;
     [Tooltip("白色底块高度相对容器高度的系数（底块高 = 容器高 × 此值）")]
     public float backdropHeightScale = 0.55f;
-    [Tooltip("是否在标签上显示液位百分比（液位% = 水格数 / 容器容量格数）")]
-    public bool showFillPercent = true;
-    [Tooltip("是否显示容器右侧的竖直液位条")]
-    public bool showFillBar = true;
-    [Tooltip("竖直液位条宽度（世界单位）")]
-    public float fillBarWidth = 0.06f;
-    [Tooltip("竖直液位条颜色")]
-    public Color fillBarColor = new Color(0.2f, 0.7f, 1f, 0.9f);
-
     [Tooltip("标签刷新间隔（秒）。降低刷新频率可减少每帧的整网格扫描次数")]
     public float refreshInterval = 0.2f;
 
     private TextMeshPro m_label;
     private SpriteRenderer m_back;
-    private SpriteRenderer m_fillBar;
     private Renderer m_labelRenderer;
     private StringBuilder m_textBuilder = new StringBuilder(64);
     private float m_refreshTimer;
     private bool m_initialized;
     private int m_cachedWater;   // 缓存水量格数，拖拽/旋转时沿用，避免毫升数跳动
-    private int m_cachedCap;     // 缓存容量格数，拖拽/旋转时沿用
 
     // 共享白色贴图（所有标签共用一张，避免重复分配）
     private static Texture2D s_whiteTex;
@@ -111,14 +100,6 @@ public class LiquidVolumeUI : MonoBehaviour
         m_back.sprite = WhiteSprite;
         m_back.color = Color.white;
         m_back.sortingOrder = 101;
-
-        // 竖直液位条（容器右侧，高度随液位缩放；不随字号缩放，按世界尺寸设置）
-        GameObject fb = new GameObject("VolumeFillBar");
-        fb.transform.SetParent(transform, false);
-        m_fillBar = fb.AddComponent<SpriteRenderer>();
-        m_fillBar.sprite = WhiteSprite;
-        m_fillBar.color = fillBarColor;
-        m_fillBar.sortingOrder = 100;
     }
 
     private void Update()
@@ -149,14 +130,10 @@ public class LiquidVolumeUI : MonoBehaviour
         {
             m_cachedWater = (source != null && !source.IsEmpty())
                 ? painter.GetWaterCountInRegion(source.regionColliders) : 0;
-            m_cachedCap = (source != null)
-                ? painter.GetCellCountInRegion(source.regionColliders) : 0;
         }
         int water = m_cachedWater;
-        int cap = m_cachedCap;
 
-        UpdateText(water, cap);
-        UpdateFillBar(cb, water, cap);
+        UpdateText(water);
 
         // ===== 尺寸依赖链：容器大小 → 白色底板尺寸 → 文字大小 =====
         m_back.gameObject.SetActive(showLabelBackdrop);
@@ -235,7 +212,7 @@ public class LiquidVolumeUI : MonoBehaviour
         return b;
     }
 
-    private void UpdateText(int water, int cap)
+    private void UpdateText(int water)
     {
         if (source == null) return;
 
@@ -246,7 +223,7 @@ public class LiquidVolumeUI : MonoBehaviour
             return;
         }
 
-        // 毫升数取整百（四舍五入）；液位条仍用精确比值，不受影响
+        // 毫升数取整百（四舍五入）
         float vol = water * mLPerCell;
         int volRounded = Mathf.FloorToInt(vol / 100f + 0.5f) * 100;
 
@@ -255,32 +232,7 @@ public class LiquidVolumeUI : MonoBehaviour
         m_textBuilder.Append('\n');
         m_textBuilder.Append(volRounded.ToString());
         m_textBuilder.Append(" mL");
-        if (showFillPercent && cap > 0)
-        {
-            float pct = (float)water / cap * 100f;
-            m_textBuilder.Append('\n');
-            m_textBuilder.Append(pct.ToString("F0"));
-            m_textBuilder.Append('%');
-        }
         m_label.text = m_textBuilder.ToString();
     }
 
-    private void UpdateFillBar(Bounds cb, int water, int cap)
-    {
-        bool show = showFillBar && source != null && !source.IsEmpty() && cap > 0;
-        m_fillBar.gameObject.SetActive(show);
-        if (!show) return;
-
-        float ratio = Mathf.Clamp01((float)water / cap);
-        float h = cb.size.y * ratio;
-        float w = Mathf.Max(fillBarWidth, 0.01f);
-
-        // 容器右侧内壁，底边对齐容器底（全部在局部空间，旋转后位置稳定）
-        float rightX = cb.center.x + cb.size.x * 0.5f - w * 0.5f;
-        float bottomY = cb.center.y - cb.size.y * 0.5f;
-        Vector3 localPos = new Vector3(rightX, bottomY + h * 0.5f, cb.center.z - 0.02f);
-
-        m_fillBar.transform.localPosition = localPos;
-        m_fillBar.transform.localScale = new Vector3(w, Mathf.Max(h, 0.001f), 1f);
-    }
 }
