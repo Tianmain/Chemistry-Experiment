@@ -636,10 +636,11 @@ public class LayerGridPainter : MonoBehaviour
     /// <summary>
     /// 从指定碰撞体区域内移除一格水（蒸发）。委托给 BubbleSystem。
     /// </summary>
-    public bool RemoveWaterFromRegion(Collider2D[] regionColliders)
+    /// <param name="spawnBubbles">是否在蒸发时生成气泡。沸腾蒸发传 true；常温缓慢蒸发传 false（不冒泡）</param>
+    public bool RemoveWaterFromRegion(Collider2D[] regionColliders, bool spawnBubbles = true)
     {
         EnsureReady();
-        return m_bubbles.RemoveWaterFromRegion(regionColliders);
+        return m_bubbles.RemoveWaterFromRegion(regionColliders, spawnBubbles);
     }
 
     /// <summary>
@@ -676,6 +677,27 @@ public class LayerGridPainter : MonoBehaviour
     {
         EnsureReady();
         m_queries.FillContainer(container, color);
+    }
+
+    /// <summary>
+    /// 把指定碰撞器区域内的「空格子」填充为给定颜色的液体（运行时由固体熔化/溶解等外部系统调用）。
+    /// 不覆盖杯壁/已有液体，水随后由模拟自然沉降。与 FillContainer 的区别：不要求容器存在 LiquidSource，
+    /// 直接按传入的碰撞器与颜色灌液，适合「固体熔化后凭空生成液体」这类场景。
+    /// </summary>
+    public void FillRegionWithLiquid(Collider2D[] regionColliders, Color color)
+    {
+        EnsureReady();
+        m_queries.FillCellsInColliders(regionColliders, color);
+    }
+
+    /// <summary>
+    /// 把指定区域内水格颜色向 targetColor 靠拢（t 为插值系数 0~1）。
+    /// 供固体溶解时让液体「变浓」而不增加体积。委托给 LiquidRegionQueries。
+    /// </summary>
+    public void TintWaterInRegion(Collider2D[] regionColliders, Color targetColor, float t)
+    {
+        EnsureReady();
+        m_queries.TintWaterInRegion(regionColliders, targetColor, t);
     }
 
     #endregion

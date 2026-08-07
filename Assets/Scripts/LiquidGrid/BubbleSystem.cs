@@ -39,8 +39,9 @@ public class BubbleSystem
     /// 从指定碰撞体区域内移除一格水（从最底部水格中随机选择一个移除，模拟底部均匀蒸发）
     /// 蒸发后会在原处或附近随机生成气泡，气泡会上浮穿过水体，模拟沸腾效果
     /// </summary>
+    /// <param name="spawnBubbles">是否在蒸发时生成气泡。沸腾蒸发传 true；常温缓慢蒸发传 false（不冒泡）</param>
     /// <returns>是否成功移除了一格水</returns>
-    public bool RemoveWaterFromRegion(Collider2D[] regionColliders)
+    public bool RemoveWaterFromRegion(Collider2D[] regionColliders, bool spawnBubbles = true)
     {
         if (m_grid.Cells == null || regionColliders == null || regionColliders.Length == 0) return false;
 
@@ -113,7 +114,8 @@ public class BubbleSystem
         m_grid.LiquidColors[selectedCol, selectedRow] = Color.clear;
 
         // Step 4: 蒸发后尝试在附近随机生成气泡（优先同一行左右两侧，确保气泡从最底层上浮）
-        if (m_owner.enableBubbles && UnityEngine.Random.value < m_owner.bubbleSpawnChance)
+        // 常温蒸发传 spawnBubbles=false 时不冒泡，仅移除水分
+        if (spawnBubbles && m_owner.enableBubbles && UnityEngine.Random.value < m_owner.bubbleSpawnChance)
         {
             SpawnBubbleNearby(selectedCol, selectedRow, regionColliders);
         }

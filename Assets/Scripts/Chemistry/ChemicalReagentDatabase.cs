@@ -31,6 +31,24 @@ namespace Chemistry
         }
 
         /// <summary>
+        /// 按「名称 + 物态」精确查找试剂。用于区分同种物质的不同物态，
+        /// 例如同时存在「固体硫酸铜」与「液体（溶液）硫酸铜」时，
+        /// 通过 state 参数锁定到具体某一态，避免两个同名资产互相干扰。
+        /// </summary>
+        public ChemicalReagent FindByNameAndState(string query, PhysicalState state)
+        {
+            if (string.IsNullOrEmpty(query) || reagents == null) return null;
+            query = query.Trim();
+            foreach (var r in reagents)
+            {
+                if (r == null) continue;
+                if (r.defaultState == state && r.MatchesName(query))
+                    return r;
+            }
+            return null;
+        }
+
+        /// <summary>
         /// 根据化学式查找试剂（精确匹配）
         /// </summary>
         public ChemicalReagent FindByFormula(string formula)

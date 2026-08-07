@@ -110,9 +110,10 @@ public class LiquidRegionQueries
     }
 
     /// <summary>
-    /// 把指定碰撞器区域内的「空格子」填为液体（不覆盖杯壁/已有液体）
+    /// 把指定碰撞器区域内的「空格子」填为液体（不覆盖杯壁/已有液体）。
+    /// 设为 internal 以便 LayerGridPainter 的 FillRegionWithLiquid 跨类调用（同程序集可见）。
     /// </summary>
-    private void FillCellsInColliders(Collider2D[] cols, Color color)
+    internal void FillCellsInColliders(Collider2D[] cols, Color color)
     {
         for (int row = 1; row < m_grid.Rows - 1; row++)
         {
@@ -220,9 +221,36 @@ public class LiquidRegionQueries
         }
     }
 
-    /// <summary>
-    /// 该液体源区域内是否还存在任意水格
-    /// </summary>
+        /// <summary>
+        /// 把指定区域内所有水格的颜色向 targetColor 靠拢（t 为插值系数 0~1）。
+        /// 用于固体溶解时让液体「变浓/变色」而不增加体积。
+        /// </summary>
+        public void TintWaterInRegion(Collider2D[] regionColliders, Color targetColor, float t)
+        {
+            if (m_grid.Cells == null || regionColliders == null || regionColliders.Length == 0) return;
+            t = Mathf.Clamp01(t);
+            for (int row = 1; row < m_grid.Rows - 1; row++)
+            {
+                for (int col = 1; col < m_grid.Columns - 1; col++)
+                {
+                    if (m_grid.Cells[col, row] != CellState.Water) continue;
+                    m_grid.SetTempToCell(col, row);
+                    foreach (var c in regionColliders)
+                    {
+                        if (c != null && c.OverlapPoint(m_grid.TempPoint))
+                        {
+                            m_grid.LiquidColors[col, row] = Color.Lerp(m_grid.LiquidColors[col, row], targetColor, t);
+                            break;
+                        }
+                    }
+                }
+            }
+            m_owner.m_isDirty = true;
+        }
+
+        /// <summary>
+        /// 该液体源区域内是否还存在任意水格
+        /// </summary>
     private bool RegionHasWater(LiquidSource src)
     {
         Collider2D[] cols = (src.regionColliders != null && src.regionColliders.Length > 0)

@@ -25,6 +25,33 @@ public class LiquidSource : MonoBehaviour
     [Tooltip("用于确定液体区域的多边形碰撞器（留空则自动获取自身及子物体的所有 Collider2D）")]
     public Collider2D[] regionColliders;
 
+    // ===== 溶解态：当前溶在本容器水里的固体（蒸干后据此析出） =====
+    // 这是溶解的逆过程所需的「记账」：固体溶进水里后，只以溶液色 + 这些字段存在，
+    // 水被蒸干（或倒掉）时再据此把溶质还原成固体。与液相 color/type 互相独立。
+
+    [Tooltip("溶解态：当前溶在水里的固体试剂（蒸干后析出为固体）。null 表示水里没有溶解物")]
+    public ChemicalReagent dissolvedReagentData = null;
+
+    [Tooltip("溶解态：溶在水里的固体质量（克）")]
+    public float dissolvedMass = 0f;
+
+    [Tooltip("溶解态：溶在水里的固体形态（析出时按此形态还原，如蒸干得晶体）")]
+    public SolidForm dissolvedForm = SolidForm.Powder;
+
+    /// <summary>
+    /// 运行期标记：本液体是「开局即配好的初始溶液」，浓度由 reagentData.defaultSolutionConcentration 决定。
+    /// 为真时 LiquidVolumeUI 每帧按当前水量反推溶解质量，使标签浓度恒等于配置浓度（不受水量变化/初始化时序影响）。
+    /// 一旦运行时发生真实化学行为（继续溶解、蒸干结晶、倾倒转移），由对应模块把本标记置 false，
+    /// 此后浓度改由实际溶解质量计算。
+    /// </summary>
+    [HideInInspector] public bool initialSolutionActive = false;
+
+    /// <summary>
+    /// 运行期防抖计数：容器「溶液（dissolvedMass>0）且区域内持续无水」的连续 tick 数，
+    /// 达到阈值才析出固体，避免水位波动瞬间误判蒸干。
+    /// </summary>
+    [System.NonSerialized] internal int crystalTicks = 0;
+
     /// <summary>
     /// 空容器标记词：当试剂名或液体类型为 "none" 时，视为「可装液体但目前无液体」的空容器。
     /// 这类容器不参与初始灌水，标签只显示 "none"。
@@ -52,6 +79,27 @@ public class LiquidSource : MonoBehaviour
         // 若试剂名 / 类型 / 资产文件名为 "none"，自动标记为空容器（持久化到序列化字段，运行时稳定）
         if (!isEmptyContainer && NameLooksEmpty())
             isEmptyContainer = true;
+
+        // 固液互斥护栏：初始配置时一个容器只能二选一（液体或固体）。
+        // 配了液体就把配对的固体清空，避免两者同配导致标签同时显示两行。
+        // 仅改序列化字段，不调用对方 OnValidate，无递归风险。
+        if (HasExplicitLiquid())
+        {
+            // 溶于水形成的溶液形态（显式标记 isAqueousSolution）被配置为「液体」时，
+            // 自动补 "(aq)" 后缀，使标签明确读作溶液（如 CuSO4 → CuSO4(aq)），
+            // 并让 IsAqueousSolution 据此识别（不再误判为纯液体 → 100%）。
+            if (reagentData != null
+                && reagentData.isAqueousSolution
+                && !liquidType.Equals("Water", System.StringComparison.OrdinalIgnoreCase)
+                && !liquidType.EndsWith("(aq)", System.StringComparison.OrdinalIgnoreCase))
+            {
+                liquidType = liquidType + "(aq)";
+            }
+
+            SolidSource sibling = GetComponent<SolidSource>();
+            if (sibling != null && sibling.HasExplicitSolid())
+                sibling.SetEmptySolid();
+        }
     }
 
     private void Awake()
@@ -145,6 +193,42 @@ public class LiquidSource : MonoBehaviour
                 return true;
         }
         return false;
+    }
+
+    /// <summary>
+    /// 当前液体源是否代表一种「真实液体」（非空容器）。用于固液互斥护栏。
+    /// </summary>
+    public bool HasExplicitLiquid()
+    {
+        return !IsEmpty();
+    }
+
+    /// <summary>
+    /// 当前液体是否为「水溶液」——溶质溶于水形成的溶液（含溶质、含水，浓度严格小于 100%）。
+    /// 判定比单纯看 "(aq)" 后缀更本质：本身是固体、又可溶于水的试剂（如 CuSO4、NaCl），
+    /// 其「液体」形态只能是水溶液；纯液体（水、乙醇）或运行时溶解产生的 "(aq)" 溶液均据此识别。
+    /// </summary>
+    public bool IsAqueousSolution()
+    {
+        if (string.IsNullOrEmpty(liquidType)) return false;
+        if (liquidType.EndsWith("(aq)", System.StringComparison.OrdinalIgnoreCase)) return true;
+        // 显式标记：本身是溶于水形成的溶液形态（如「硫酸铜溶液」资产 defaultState 虽为 Liquid，但本质是水溶液）
+        if (reagentData != null && reagentData.isAqueousSolution) return true;
+        return false;
+    }
+
+    /// <summary>
+    /// 清空液体（互斥护栏用）：把液体还原为 none 空态，并清掉溶解态记账。
+    /// 仅修改序列化字段，不触发其它组件的 OnValidate（无递归风险）。
+    /// </summary>
+    public void SetEmptyLiquid()
+    {
+        liquidType = EMPTY_MARKER;
+        reagentData = null;
+        isEmptyContainer = true;
+        dissolvedReagentData = null;
+        dissolvedMass = 0f;
+        dissolvedForm = SolidForm.Powder;
     }
 
     /// <summary>

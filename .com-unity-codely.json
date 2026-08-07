@@ -1,10 +1,10 @@
 {
-  "unity_port": 65076,
-  "stream_port": 54216,
+  "unity_port": 63775,
+  "stream_port": 58072,
   "created_date": "2026-05-23T04:22:29.6834280Z",
   "project_path": "D:/Unity/Projects/Chemistry Experiment/Assets",
   "reloading": false,
   "reason": "ready",
   "seq": 1,
-  "last_heartbeat": "2026-08-06T05:10:38.3901978Z"
+  "last_heartbeat": "2026-08-07T12:21:25.9376225Z"
 }

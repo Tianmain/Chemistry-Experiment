@@ -1,5 +1,6 @@
 using UnityEngine;
 using System.Collections.Generic;
+using Chemistry;
 
 /// <summary>
 /// 拖拽 / 旋转控制子系统：处理左键拖拽物体、倾倒、右键 90° 旋转杯体并让内部液体随杯刚性旋转。
@@ -760,6 +761,84 @@ public class DragController
         // 3. 解除粘合：液体成为自由模拟水，由水模拟负责从杯口流出
         m_owner.m_draggedCoverage = null;
         m_owner.m_isDirty = true;
+
+        // 把溶液里溶着的固体随液体一起搬移到承接容器：
+        // 否则倒空后源容器水为 0、却被误判为「蒸干」而在源里析出固体。
+        LiquidSource pouredSrc = m_owner.m_draggedObject.GetComponentInChildren<LiquidSource>();
+        if (pouredSrc != null) TransferDissolvedOnPour(pouredSrc);
+    }
+
+    /// <summary>
+    /// 倾倒时把源容器溶液里「溶着的固体」随液体一起搬走：
+    /// 统计被倒出的水格落到了哪个承接容器的区域里（按落点水格数最多者），
+    /// 把溶解质量整体转移过去；若倒在了地上（无承接容器）则随溶液一起丢弃。
+    /// 这样可避免「倒空后源容器水为 0、却被误判为蒸干、在源里析出固体」的错误。
+    /// </summary>
+    private void TransferDissolvedOnPour(LiquidSource src)
+    {
+        if (src == null || src.dissolvedMass <= 0.0001f) return;
+
+        LiquidSource bestTarget = null;
+        int bestCount = 0;
+
+        var solids = (SolidSystem.Instance != null) ? SolidSystem.Instance.GetAllSolids() : null;
+        if (solids != null)
+        {
+            foreach (var solid in solids)
+            {
+                LiquidSource ls = (solid != null) ? solid.GetPairedLiquidSource() : null;
+                if (ls == null || ls == src) continue;
+                Collider2D[] cols = ls.regionColliders;
+                if (cols == null || cols.Length == 0) continue;
+
+                int cnt = 0;
+                for (int row = 1; row < m_grid.Rows - 1; row++)
+                {
+                    for (int col = 1; col < m_grid.Columns - 1; col++)
+                    {
+                        if (m_grid.Cells[col, row] != CellState.Water) continue;
+                        m_grid.SetTempToCell(col, row);
+                        foreach (var c in cols)
+                        {
+                            if (c != null && c.OverlapPoint(m_grid.TempPoint)) { cnt++; break; }
+                        }
+                    }
+                }
+                if (cnt > bestCount) { bestCount = cnt; bestTarget = ls; }
+            }
+        }
+
+        if (bestTarget != null && bestCount > 0)
+        {
+            bestTarget.dissolvedReagentData = src.dissolvedReagentData;
+            bestTarget.dissolvedForm = src.dissolvedForm;
+            bestTarget.dissolvedMass += src.dissolvedMass;
+            // 倾倒转移 → 承接容器浓度改由实际溶解质量计算，解除初始溶液锁定
+            bestTarget.initialSolutionActive = false;
+
+            // 让承接容器显示为溶液（若原本是空 / 纯水）
+            if (string.IsNullOrEmpty(bestTarget.liquidType) || bestTarget.liquidType == "Water"
+                || bestTarget.liquidType == LiquidSource.EMPTY_MARKER)
+            {
+                bestTarget.isEmptyContainer = false;
+                string baseName = (src.dissolvedReagentData != null)
+                    ? (!string.IsNullOrEmpty(src.dissolvedReagentData.englishName)
+                        ? src.dissolvedReagentData.englishName
+                        : src.dissolvedReagentData.reagentName)
+                    : "Solute";
+                bestTarget.liquidType = baseName + "(aq)";
+                bestTarget.useReagentColor = false;
+                if (src.dissolvedReagentData != null)
+                    bestTarget.liquidColor = src.dissolvedReagentData.GetDisplayColor();
+            }
+        }
+
+        // 源容器不再持有溶解质量（无论是否找到承接容器：倒到地上就随溶液一起丢弃）
+        src.dissolvedReagentData = null;
+        src.dissolvedForm = SolidForm.Powder;
+        src.dissolvedMass = 0f;
+        src.crystalTicks = 0;
+        src.initialSolutionActive = false;
     }
 
     /// <summary>

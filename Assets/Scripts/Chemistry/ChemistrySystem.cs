@@ -47,6 +47,15 @@ namespace Chemistry
         }
 
         /// <summary>
+        /// 按「名称 + 物态」查找试剂（便捷静态方法）。
+        /// 用于区分同种物质的不同物态，例如「固体硫酸铜」与「液体硫酸铜」。
+        /// </summary>
+        public static ChemicalReagent FindReagent(string name, PhysicalState state)
+        {
+            return Database != null ? Database.FindByNameAndState(name, state) : null;
+        }
+
+        /// <summary>
         /// 按化学式查找试剂（便捷静态方法）
         /// </summary>
         public static ChemicalReagent FindReagentByFormula(string formula)
